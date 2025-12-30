@@ -1,0 +1,26 @@
+[project]
+name = "hacs-linky"
+version = "0.1.0"
+description = "Home Assistant integration for Linky smart meters"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-homeassistant-custom-component>=0.13.180",
+    "pylinky @ git+https://github.com/guilhem/pylinky.git",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

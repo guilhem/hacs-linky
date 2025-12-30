@@ -1,0 +1,50 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configure Linky",
+        "description": "Enter your authentication token from [{conso_url}]({conso_url})",
+        "data": {
+          "token": "Token"
+        }
+      },
+      "select_prm": {
+        "title": "Select meter",
+        "description": "Your token grants access to multiple meters. Select the one you want to configure.",
+        "data": {
+          "prm": "Meter (PRM)"
+        }
+      }
+    },
+    "error": {
+      "invalid_token": "The token is invalid or expired",
+      "prm_access_denied": "This token does not grant access to this meter",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This meter is already configured"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "daily_consumption": {
+        "name": "Daily consumption"
+      },
+      "total_consumption_week": {
+        "name": "Total consumption (7 days)"
+      },
+      "current_power": {
+        "name": "Current power"
+      },
+      "max_power": {
+        "name": "Maximum power"
+      },
+      "daily_production": {
+        "name": "Daily production"
+      },
+      "current_production_power": {
+        "name": "Production power"
+      }
+    }
+  }
+}

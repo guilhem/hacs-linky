@@ -1,0 +1,13 @@
+{
+  "domain": "linky",
+  "name": "Linky",
+  "codeowners": ["@guilhem"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/guilhem/hacs-linky",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/guilhem/hacs-linky/issues",
+  "requirements": ["pylinky @ git+https://github.com/guilhem/pylinky.git@v0.1.0"],
+  "version": "0.1.0"
+}

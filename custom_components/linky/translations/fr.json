@@ -1,0 +1,50 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configurer Linky",
+        "description": "Entrez votre token d'authentification obtenu sur [{conso_url}]({conso_url})",
+        "data": {
+          "token": "Token"
+        }
+      },
+      "select_prm": {
+        "title": "Sélection du compteur",
+        "description": "Votre token donne accès à plusieurs compteurs. Sélectionnez celui que vous souhaitez configurer.",
+        "data": {
+          "prm": "Compteur (PRM)"
+        }
+      }
+    },
+    "error": {
+      "invalid_token": "Le token est invalide ou expiré",
+      "prm_access_denied": "Ce token ne permet pas d'accéder à ce compteur",
+      "unknown": "Erreur inattendue"
+    },
+    "abort": {
+      "already_configured": "Ce compteur est déjà configuré"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "daily_consumption": {
+        "name": "Consommation journalière"
+      },
+      "total_consumption_week": {
+        "name": "Consommation totale (7 jours)"
+      },
+      "current_power": {
+        "name": "Puissance actuelle"
+      },
+      "max_power": {
+        "name": "Puissance maximale"
+      },
+      "daily_production": {
+        "name": "Production journalière"
+      },
+      "current_production_power": {
+        "name": "Puissance de production"
+      }
+    }
+  }
+}
