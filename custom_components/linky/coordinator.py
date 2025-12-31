@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import date, timedelta
 import logging
@@ -16,7 +17,7 @@ from pylinky import (
     MeteringData,
 )
 
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import API_REQUEST_DELAY, DEFAULT_SCAN_INTERVAL, DOMAIN
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -64,7 +65,8 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         data = LinkyData()
 
         try:
-            # Fetch consumption data
+            # Fetch consumption data with delays between requests
+            # to respect API rate limits (max 5 req/sec)
             try:
                 data.daily_consumption = await self.client.get_daily_consumption(
                     start=start, end=end
@@ -73,6 +75,8 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 raise
             except APIError as err:
                 _LOGGER.debug("Failed to fetch daily consumption: %s", err)
+
+            await asyncio.sleep(API_REQUEST_DELAY)
 
             try:
                 data.load_curve = await self.client.get_consumption_load_curve(
@@ -83,12 +87,16 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             except APIError as err:
                 _LOGGER.debug("Failed to fetch load curve: %s", err)
 
+            await asyncio.sleep(API_REQUEST_DELAY)
+
             try:
                 data.max_power = await self.client.get_max_power(start=start, end=end)
             except AuthenticationError:
                 raise
             except APIError as err:
                 _LOGGER.debug("Failed to fetch max power: %s", err)
+
+            await asyncio.sleep(API_REQUEST_DELAY)
 
             # Fetch production data (may fail if user has no solar panels)
             try:
@@ -99,6 +107,8 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 raise
             except APIError as err:
                 _LOGGER.debug("Failed to fetch daily production: %s", err)
+
+            await asyncio.sleep(API_REQUEST_DELAY)
 
             try:
                 data.production_load_curve = await self.client.get_production_load_curve(

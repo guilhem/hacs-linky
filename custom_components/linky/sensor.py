@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -30,6 +31,7 @@ class LinkySensorEntityDescription(SensorEntityDescription):
     value_fn: Callable[[LinkyData], int | float | None]
     available_fn: Callable[[LinkyData], bool]
     extra_state_fn: Callable[[LinkyData], dict[str, Any]] | None = None
+    last_reset_fn: Callable[[LinkyData], datetime | None] | None = None
 
 
 def _get_last_reading_attrs(data: LinkyData, attr: str) -> dict[str, Any]:
@@ -52,7 +54,7 @@ SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
         translation_key="daily_consumption",
         native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.TOTAL,
         value_fn=lambda data: (
             data.daily_consumption.interval_reading[-1].value
             if data.daily_consumption and data.daily_consumption.interval_reading
@@ -60,6 +62,15 @@ SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
         ),
         available_fn=lambda data: data.daily_consumption is not None,
         extra_state_fn=lambda data: _get_last_reading_attrs(data, "daily_consumption"),
+        last_reset_fn=lambda data: (
+            datetime.combine(
+                data.daily_consumption.interval_reading[-1].date,
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
+            if data.daily_consumption and data.daily_consumption.interval_reading
+            else None
+        ),
     ),
     LinkySensorEntityDescription(
         key="total_consumption_week",
@@ -71,6 +82,11 @@ SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
             data.daily_consumption.total if data.daily_consumption else None
         ),
         available_fn=lambda data: data.daily_consumption is not None,
+        last_reset_fn=lambda data: (
+            datetime.combine(data.daily_consumption.start, datetime.min.time(), tzinfo=timezone.utc)
+            if data.daily_consumption
+            else None
+        ),
     ),
     LinkySensorEntityDescription(
         key="current_power",
@@ -104,7 +120,7 @@ SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
         translation_key="daily_production",
         native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.TOTAL,
         value_fn=lambda data: (
             data.daily_production.interval_reading[-1].value
             if data.daily_production and data.daily_production.interval_reading
@@ -112,6 +128,15 @@ SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
         ),
         available_fn=lambda data: data.daily_production is not None,
         extra_state_fn=lambda data: _get_last_reading_attrs(data, "daily_production"),
+        last_reset_fn=lambda data: (
+            datetime.combine(
+                data.daily_production.interval_reading[-1].date,
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
+            if data.daily_production and data.daily_production.interval_reading
+            else None
+        ),
         entity_registry_enabled_default=False,
     ),
     LinkySensorEntityDescription(
@@ -193,3 +218,12 @@ class LinkySensor(CoordinatorEntity[LinkyDataUpdateCoordinator], SensorEntity):
         if self.entity_description.extra_state_fn is None:
             return None
         return self.entity_description.extra_state_fn(self.coordinator.data)
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return the time when the sensor was last reset."""
+        if self.coordinator.data is None:
+            return None
+        if self.entity_description.last_reset_fn is None:
+            return None
+        return self.entity_description.last_reset_fn(self.coordinator.data)

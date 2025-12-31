@@ -37,7 +37,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> boo
         client = AsyncLinkyClient(
             token=token,
             prm=prm,
-            user_agent=f"hacs-linky/{entry.version}",
+            user_agent="github.com/guilhem/hacs-linky",
             ssl_context=ssl_context,
         )
     except InvalidTokenError as err:

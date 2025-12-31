@@ -12,6 +12,9 @@ CONF_PRM: Final = "prm"
 # Default values
 DEFAULT_SCAN_INTERVAL: Final = timedelta(hours=6)
 
+# API rate limiting: 5 req/sec max, we use 200ms delay between requests to be safe
+API_REQUEST_DELAY: Final = 0.2
+
 # Attributes
 ATTR_USAGE_POINT_ID: Final = "usage_point_id"
 ATTR_QUALITY: Final = "quality"

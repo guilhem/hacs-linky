@@ -54,7 +54,7 @@ async def test_daily_consumption_sensor(
     assert state.state == "12100"
     assert state.attributes["unit_of_measurement"] == UnitOfEnergy.WATT_HOUR
     assert state.attributes["device_class"] == "energy"
-    assert state.attributes["state_class"] == "total_increasing"
+    assert state.attributes["state_class"] == "total"
     assert state.attributes["usage_point_id"] == "12345678901234"
     assert state.attributes["quality"] == "BRUT"
 
