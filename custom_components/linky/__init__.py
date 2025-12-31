@@ -8,7 +8,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_TOKEN, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
-from pylinky import AsyncLinkyClient, AuthenticationError, InvalidTokenError
+from pylinky import (
+    AsyncLinkyClient,
+    AuthenticationError,
+    InvalidTokenError,
+    create_ssl_context,
+)
 
 from .const import CONF_PRM, DOMAIN
 from .coordinator import LinkyDataUpdateCoordinator
@@ -25,11 +30,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> boo
     token = entry.data[CONF_TOKEN]
     prm = entry.data[CONF_PRM]
 
+    # Create SSL context in executor to avoid blocking the event loop
+    ssl_context = await hass.async_add_executor_job(create_ssl_context)
+
     try:
         client = AsyncLinkyClient(
             token=token,
             prm=prm,
             user_agent=f"hacs-linky/{entry.version}",
+            ssl_context=ssl_context,
         )
     except InvalidTokenError as err:
         raise ConfigEntryAuthFailed("Invalid token") from err

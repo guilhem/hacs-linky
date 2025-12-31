@@ -150,7 +150,7 @@ async def test_form_unknown_error(hass: HomeAssistant) -> None:
 
     with patch(
         "custom_components.linky.config_flow.AsyncLinkyClient",
-        side_effect=Exception("Unknown error"),
+        side_effect=RuntimeError("Unknown error"),
     ):
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"],
