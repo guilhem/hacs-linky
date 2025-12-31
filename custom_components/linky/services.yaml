@@ -1,0 +1,18 @@
+import_historical_data:
+  name: Import historical data
+  description: Import historical consumption and production data from a specific start date
+  fields:
+    start_date:
+      name: Start date
+      description: Start date for importing historical data (YYYY-MM-DD)
+      required: true
+      example: "2024-01-01"
+      selector:
+        date:
+    end_date:
+      name: End date
+      description: End date for importing historical data (YYYY-MM-DD). Defaults to today.
+      required: false
+      example: "2024-12-31"
+      selector:
+        date:

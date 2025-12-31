@@ -25,13 +25,26 @@
       "already_configured": "Ce compteur est déjà configuré"
     }
   },
+  "services": {
+    "import_historical_data": {
+      "name": "Importer l'historique",
+      "description": "Importe les données historiques de consommation et production depuis une date spécifique",
+      "fields": {
+        "start_date": {
+          "name": "Date de début",
+          "description": "Date de début pour l'import des données (YYYY-MM-DD)"
+        },
+        "end_date": {
+          "name": "Date de fin",
+          "description": "Date de fin pour l'import (YYYY-MM-DD). Par défaut: aujourd'hui"
+        }
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "daily_consumption": {
         "name": "Consommation journalière"
-      },
-      "total_consumption_week": {
-        "name": "Consommation totale (7 jours)"
       },
       "current_power": {
         "name": "Puissance actuelle"

@@ -20,7 +20,13 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import LinkyConfigEntry
-from .const import ATTR_LAST_DATE, ATTR_LAST_VALUE, ATTR_QUALITY, ATTR_USAGE_POINT_ID, DOMAIN
+from .const import (
+    ATTR_LAST_DATE,
+    ATTR_LAST_VALUE,
+    ATTR_QUALITY,
+    ATTR_USAGE_POINT_ID,
+    DOMAIN,
+)
 from .coordinator import LinkyData, LinkyDataUpdateCoordinator
 
 
@@ -69,22 +75,6 @@ SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
                 tzinfo=timezone.utc,
             )
             if data.daily_consumption and data.daily_consumption.interval_reading
-            else None
-        ),
-    ),
-    LinkySensorEntityDescription(
-        key="total_consumption_week",
-        translation_key="total_consumption_week",
-        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL,
-        value_fn=lambda data: (
-            data.daily_consumption.total if data.daily_consumption else None
-        ),
-        available_fn=lambda data: data.daily_consumption is not None,
-        last_reset_fn=lambda data: (
-            datetime.combine(data.daily_consumption.start, datetime.min.time(), tzinfo=timezone.utc)
-            if data.daily_consumption
             else None
         ),
     ),
@@ -165,8 +155,7 @@ async def async_setup_entry(
     coordinator = entry.runtime_data
 
     async_add_entities(
-        LinkySensor(coordinator, description, entry)
-        for description in SENSOR_DESCRIPTIONS
+        LinkySensor(coordinator, description, entry) for description in SENSOR_DESCRIPTIONS
     )
 
 
@@ -221,6 +210,18 @@ class LinkySensor(CoordinatorEntity[LinkyDataUpdateCoordinator], SensorEntity):
 
     @property
     def last_reset(self) -> datetime | None:
+        """Return the time when the sensor was last reset."""
+        if self.coordinator.data is None:
+            return None
+        if self.entity_description.last_reset_fn is None:
+            return None
+        return self.entity_description.last_reset_fn(self.coordinator.data)
+        """Return the time when the sensor was last reset."""
+        if self.coordinator.data is None:
+            return None
+        if self.entity_description.last_reset_fn is None:
+            return None
+        return self.entity_description.last_reset_fn(self.coordinator.data)
         """Return the time when the sensor was last reset."""
         if self.coordinator.data is None:
             return None

@@ -3,11 +3,7 @@
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from homeassistant.const import (
-    STATE_UNAVAILABLE,
-    UnitOfEnergy,
-    UnitOfPower,
-)
+from homeassistant.const import STATE_UNAVAILABLE, UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from pylinky import MeteringData
@@ -28,7 +24,6 @@ async def test_sensors_created(
 
     # Check consumption sensors are created
     assert entity_registry.async_get("sensor.linky_12345678901234_daily_consumption")
-    assert entity_registry.async_get("sensor.linky_12345678901234_total_consumption_7_days")
     assert entity_registry.async_get("sensor.linky_12345678901234_current_power")
     assert entity_registry.async_get("sensor.linky_12345678901234_maximum_power")
 
@@ -57,23 +52,6 @@ async def test_daily_consumption_sensor(
     assert state.attributes["state_class"] == "total"
     assert state.attributes["usage_point_id"] == "12345678901234"
     assert state.attributes["quality"] == "BRUT"
-
-
-async def test_total_consumption_week_sensor(
-    hass: HomeAssistant,
-    mock_linky_client: AsyncMock,
-    mock_config_entry,
-    daily_consumption_data: MeteringData,
-) -> None:
-    """Test total consumption week sensor."""
-    await hass.config_entries.async_setup(mock_config_entry.entry_id)
-    await hass.async_block_till_done()
-
-    state = hass.states.get("sensor.linky_12345678901234_total_consumption_7_days")
-    assert state is not None
-    # Sum of all readings
-    expected_total = sum(r.value for r in daily_consumption_data.interval_reading)
-    assert state.state == str(expected_total)
 
 
 async def test_current_power_sensor(

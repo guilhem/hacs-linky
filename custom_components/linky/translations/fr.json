@@ -30,9 +30,6 @@
       "daily_consumption": {
         "name": "Consommation journalière"
       },
-      "total_consumption_week": {
-        "name": "Consommation totale (7 jours)"
-      },
       "current_power": {
         "name": "Puissance actuelle"
       },
