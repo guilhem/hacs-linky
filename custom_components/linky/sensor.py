@@ -1,7 +1,7 @@
 """Sensor platform for Linky integration."""
 
 # pylint: disable=unexpected-keyword-arg,unused-argument
-# type: ignore reportIncompatibleVariableOverride
+# type: ignore[reportIncompatibleVariableOverride]
 
 from __future__ import annotations
 
@@ -61,7 +61,11 @@ def _get_last_reading_attrs(data: LinkyData, attr: str) -> dict[str, Any]:
         data_age_hours = (dt_util.utcnow() - last_date).total_seconds() / 3600
     else:
         # If date only, assume end of day in UTC
-        last_datetime = datetime.combine(last_date, datetime.max.time(), tzinfo=timezone.utc)  # noqa: UP017
+        last_datetime = datetime.combine(
+            last_date,
+            datetime.max.time(),
+            tzinfo=timezone.utc,  # noqa: UP017
+        )
         data_age_hours = (dt_util.utcnow() - last_datetime).total_seconds() / 3600
 
     return {

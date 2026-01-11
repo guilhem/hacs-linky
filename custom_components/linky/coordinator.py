@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
@@ -21,6 +20,7 @@ from homeassistant.components.recorder.statistics import (
 )
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.recorder import get_instance
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import EnergyConverter
@@ -81,15 +81,6 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         This updates names for existing statistic IDs without altering data.
         Safe to call at startup; ignored if recorder not available.
         """
-        try:
-            # Imported lazily to avoid hard dependency issues during tests
-            from homeassistant.components.recorder.statistics import (
-                async_update_statistics_metadata,
-            )
-        except Exception:  # noqa: BLE001
-            _LOGGER.debug("Recorder/statistics update not available; skip metadata rename")
-            return
-
         prm = self.client.prm
         updates: list[tuple[str, str]] = [
             (f"{DOMAIN}:{prm}_energy_consumption", f"Linky {prm} consumption"),
@@ -99,16 +90,18 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         ]
 
         for statistic_id, name in updates:
-            try:
-                await async_update_statistics_metadata(
-                    self.hass,
-                    statistic_id,
-                    {"name": name},
-                )
-                _LOGGER.debug("Updated statistics metadata name for %s", statistic_id)
-            except Exception as err:  # noqa: BLE001
-                # Best-effort; continue with others
-                _LOGGER.debug("Failed to update metadata for %s: %s", statistic_id, err)
+            # Best-effort metadata refresh: re-announce metadata via recorder
+            metadata = StatisticMetaData(
+                mean_type=StatisticMeanType.NONE,
+                has_sum=True,
+                name=name,
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                unit_class=EnergyConverter.UNIT_CLASS,
+                unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            )
+            # Passing an empty statistics list hints recorder to update metadata if needed
+            async_add_external_statistics(self.hass, metadata, [])
 
     def _get_fetch_start_date(self, last_date: date | None) -> date:
         """Calculate optimal start date for API fetch.
@@ -181,7 +174,10 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         )
 
         _LOGGER.debug(
-            "Fetching data from %s to %s (last known dates: consumption=%s, load_curve=%s, production=%s)",
+            (
+                "Fetching data from %s to %s (last known dates: "
+                "consumption=%s, load_curve=%s, production=%s)"
+            ),
             start,
             end,
             self._last_consumption_date,
@@ -242,7 +238,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
 
         except AuthenticationError as err:
             raise UpdateFailed(f"Authentication failed: {err}") from err
-        except Exception as err:
+        except (OSError, TimeoutError) as err:
             raise UpdateFailed(f"Error communicating with API: {err}") from err
 
         # If we got no data at all, something is wrong
@@ -260,7 +256,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 load_curve=data.load_curve,
                 production_load_curve=data.production_load_curve,
             )
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             # Recorder may not be available (e.g., in tests or if disabled)
             _LOGGER.debug("Failed to insert statistics: %s", err)
 
@@ -325,20 +321,21 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             last_stats_time = None
         else:
             # Get info about last statistic
-            last_stats_time = last_stat[consumption_statistic_id][0]["start"]
+            row = last_stat.get(consumption_statistic_id, [{}])[0]
+            last_stats_time = row.get("start")  # type: ignore[assignment]
 
             # Get current sum from last statistic
-            consumption_sum = float(last_stat[consumption_statistic_id][0].get("sum", 0))
+            consumption_sum = float(row.get("sum") or 0)
 
             # Get production sum if exists
             last_prod_stat = await get_instance(self.hass).async_add_executor_job(
                 get_last_statistics, self.hass, 1, production_statistic_id, True, set()
             )
-            production_sum = (
-                float(last_prod_stat[production_statistic_id][0].get("sum", 0))
-                if last_prod_stat
-                else 0.0
-            )
+            if last_prod_stat:
+                prod_row = last_prod_stat.get(production_statistic_id, [{}])[0]
+                production_sum = float(prod_row.get("sum") or 0)
+            else:
+                production_sum = 0.0
 
         # Process consumption data (already fetched by _async_update_data)
         consumption_statistics = []
@@ -480,8 +477,9 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             energy_sum = 0.0
             last_stats_time = None
         else:
-            last_stats_time = last_stat[statistic_id][0]["start"]
-            energy_sum = float(last_stat[statistic_id][0].get("sum", 0))
+            row = last_stat.get(statistic_id, [{}])[0]
+            last_stats_time = row.get("start")  # type: ignore[assignment]
+            energy_sum = float(row.get("sum") or 0)
 
         # Aggregate 30-min readings to hourly
         # Group readings by the hour they belong to
@@ -585,18 +583,19 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
 
         # Get the sum at the start date or initialize
         if last_stat:
-            consumption_sum = float(last_stat[consumption_statistic_id][0].get("sum", 0))
+            cons_row = last_stat.get(consumption_statistic_id, [{}])[0]
+            consumption_sum = float(cons_row.get("sum") or 0)
         else:
             consumption_sum = 0.0
 
         last_prod_stat = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics, self.hass, 1, production_statistic_id, True, set()
         )
-        production_sum = (
-            float(last_prod_stat[production_statistic_id][0].get("sum", 0))
-            if last_prod_stat
-            else 0.0
-        )
+        if last_prod_stat:
+            prod_row = last_prod_stat.get(production_statistic_id, [{}])[0]
+            production_sum = float(prod_row.get("sum") or 0)
+        else:
+            production_sum = 0.0
 
         _LOGGER.debug("Fetching consumption data from %s to %s", start, end)
 
