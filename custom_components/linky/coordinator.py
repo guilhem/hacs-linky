@@ -81,6 +81,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         This updates names for existing statistic IDs without altering data.
         Safe to call at startup; ignored if recorder not available.
         """
+        utcnow = dt_util.utcnow()
         prm = self.client.prm
         updates: list[tuple[str, str]] = [
             # Keep only kWh-based statistics (Energy Dashboard friendly)
@@ -103,6 +104,21 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             )
             # Passing an empty statistics list hints recorder to update metadata if needed
             async_add_external_statistics(self.hass, metadata, [])
+
+            # If the statistic does not exist yet, seed a zero point so Energy UI can attach a price
+            last_stat = await get_instance(self.hass).async_add_executor_job(
+                get_last_statistics, self.hass, 1, statistic_id, True, set()
+            )
+            if not last_stat:
+                # Align timestamps: daily at midnight, hourly at current hour
+                if "hourly" in statistic_id:
+                    seed_time = utcnow.replace(minute=0, second=0, microsecond=0)
+                else:
+                    seed_time = datetime.combine(utcnow.date(), datetime.min.time())
+                    seed_time = dt_util.as_utc(seed_time)
+
+                seed = StatisticData(start=seed_time, state=0.0, sum=0.0)
+                async_add_external_statistics(self.hass, metadata, [seed])
 
     def _get_fetch_start_date(self, last_date: date | None) -> date:
         """Calculate optimal start date for API fetch.
