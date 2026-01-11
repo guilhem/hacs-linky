@@ -75,6 +75,41 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         self._last_load_curve_date: date | None = None
         self._last_production_date: date | None = None
 
+    async def async_ensure_statistics_names(self) -> None:
+        """Ensure statistics metadata names are up to date.
+
+        This updates names for existing statistic IDs without altering data.
+        Safe to call at startup; ignored if recorder not available.
+        """
+        try:
+            # Imported lazily to avoid hard dependency issues during tests
+            from homeassistant.components.recorder.statistics import (
+                async_update_statistics_metadata,
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Recorder/statistics update not available; skip metadata rename")
+            return
+
+        prm = self.client.prm
+        updates: list[tuple[str, str]] = [
+            (f"{DOMAIN}:{prm}_energy_consumption", f"Linky {prm} consumption"),
+            (f"{DOMAIN}:{prm}_energy_production", f"Linky {prm} production"),
+            (f"{DOMAIN}:{prm}_energy_consumption_hourly", f"Linky {prm} hourly consumption"),
+            (f"{DOMAIN}:{prm}_energy_production_hourly", f"Linky {prm} hourly production"),
+        ]
+
+        for statistic_id, name in updates:
+            try:
+                await async_update_statistics_metadata(
+                    self.hass,
+                    statistic_id,
+                    {"name": name},
+                )
+                _LOGGER.debug("Updated statistics metadata name for %s", statistic_id)
+            except Exception as err:  # noqa: BLE001
+                # Best-effort; continue with others
+                _LOGGER.debug("Failed to update metadata for %s: %s", statistic_id, err)
+
     def _get_fetch_start_date(self, last_date: date | None) -> date:
         """Calculate optimal start date for API fetch.
 
@@ -133,11 +168,14 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         end = date.today()
         start = self._get_fetch_start_date(
             min(
-                filter(None, [
-                    self._last_consumption_date,
-                    self._last_load_curve_date,
-                    self._last_production_date,
-                ]),
+                filter(
+                    None,
+                    [
+                        self._last_consumption_date,
+                        self._last_load_curve_date,
+                        self._last_production_date,
+                    ],
+                ),
                 default=None,
             )
         )

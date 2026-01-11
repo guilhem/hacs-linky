@@ -58,9 +58,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> boo
         raise ConfigEntryAuthFailed("Invalid token") from err
 
     # Get scan interval from options or use default
-    scan_interval_hours = entry.options.get(
-        CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS
-    )
+    scan_interval_hours = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS)
 
     coordinator = LinkyDataUpdateCoordinator(hass, client, scan_interval_hours)
 
@@ -70,6 +68,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> boo
         raise ConfigEntryAuthFailed("Authentication failed") from err
 
     entry.runtime_data = coordinator
+
+    # Ensure statistics display names are up to date (Energy Dashboard label)
+    await coordinator.async_ensure_statistics_names()
 
     # Listen for options updates
     entry.async_on_unload(entry.add_update_listener(async_update_options))
