@@ -18,7 +18,7 @@ from pylinky import (
     create_ssl_context,
 )
 
-from .const import CONF_PRM, DOMAIN
+from .const import CONF_PRM, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS, DOMAIN
 from .coordinator import LinkyDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -57,7 +57,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> boo
     except InvalidTokenError as err:
         raise ConfigEntryAuthFailed("Invalid token") from err
 
-    coordinator = LinkyDataUpdateCoordinator(hass, client)
+    # Get scan interval from options or use default
+    scan_interval_hours = entry.options.get(
+        CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS
+    )
+
+    coordinator = LinkyDataUpdateCoordinator(hass, client, scan_interval_hours)
 
     try:
         await coordinator.async_config_entry_first_refresh()
@@ -65,6 +70,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> boo
         raise ConfigEntryAuthFailed("Authentication failed") from err
 
     entry.runtime_data = coordinator
+
+    # Listen for options updates
+    entry.async_on_unload(entry.add_update_listener(async_update_options))
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -103,6 +111,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> boo
         )
 
     return True
+
+
+async def async_update_options(hass: HomeAssistant, entry: LinkyConfigEntry) -> None:
+    """Handle options update."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> bool:

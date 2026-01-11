@@ -1,5 +1,8 @@
 """Sensor platform for Linky integration."""
 
+# pylint: disable=unexpected-keyword-arg,unused-argument
+# type: ignore reportIncompatibleVariableOverride
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -18,9 +21,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from . import LinkyConfigEntry
 from .const import (
+    ATTR_DATA_AGE_HOURS,
     ATTR_LAST_DATE,
     ATTR_LAST_VALUE,
     ATTR_QUALITY,
@@ -46,11 +51,25 @@ def _get_last_reading_attrs(data: LinkyData, attr: str) -> dict[str, Any]:
     if metering_data is None or not metering_data.interval_reading:
         return {}
     last = metering_data.interval_reading[-1]
+
+    # Calculate data age in hours
+    last_date = last.date
+    if isinstance(last_date, datetime):
+        # If datetime, use it directly (ensure timezone aware)
+        if last_date.tzinfo is None:
+            last_date = last_date.replace(tzinfo=timezone.utc)  # noqa: UP017
+        data_age_hours = (dt_util.utcnow() - last_date).total_seconds() / 3600
+    else:
+        # If date only, assume end of day in UTC
+        last_datetime = datetime.combine(last_date, datetime.max.time(), tzinfo=timezone.utc)  # noqa: UP017
+        data_age_hours = (dt_util.utcnow() - last_datetime).total_seconds() / 3600
+
     return {
         ATTR_USAGE_POINT_ID: metering_data.usage_point_id,
         ATTR_QUALITY: metering_data.quality,
         ATTR_LAST_VALUE: last.value,
         ATTR_LAST_DATE: last.date.isoformat(),
+        ATTR_DATA_AGE_HOURS: round(data_age_hours, 1),
     }
 
 
@@ -72,7 +91,7 @@ SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
             datetime.combine(
                 data.daily_consumption.interval_reading[-1].date,
                 datetime.min.time(),
-                tzinfo=timezone.utc,
+                tzinfo=timezone.utc,  # noqa: UP017
             )
             if data.daily_consumption and data.daily_consumption.interval_reading
             else None
@@ -122,7 +141,7 @@ SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
             datetime.combine(
                 data.daily_production.interval_reading[-1].date,
                 datetime.min.time(),
-                tzinfo=timezone.utc,
+                tzinfo=timezone.utc,  # noqa: UP017
             )
             if data.daily_production and data.daily_production.interval_reading
             else None
@@ -162,7 +181,7 @@ async def async_setup_entry(
 class LinkySensor(CoordinatorEntity[LinkyDataUpdateCoordinator], SensorEntity):
     """Representation of a Linky sensor."""
 
-    entity_description: LinkySensorEntityDescription
+    entity_description: LinkySensorEntityDescription  # type: ignore[assignment]
     _attr_has_entity_name = True
 
     def __init__(
@@ -173,18 +192,19 @@ class LinkySensor(CoordinatorEntity[LinkyDataUpdateCoordinator], SensorEntity):
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator)
-        self.entity_description = description
+        self.entity_description = description  # type: ignore[assignment]
         self._attr_unique_id = f"{entry.unique_id}_{description.key}"
+        unique_id = entry.unique_id or ""
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.unique_id)},
-            name=f"Linky {entry.unique_id}",
+            identifiers={(DOMAIN, unique_id)},
+            name=f"Linky {unique_id}",
             manufacturer="Enedis",
             model="Linky",
             entry_type=DeviceEntryType.SERVICE,
         )
 
     @property
-    def available(self) -> bool:
+    def available(self) -> bool:  # type: ignore[override]
         """Return if entity is available."""
         if not super().available:
             return False
@@ -193,14 +213,14 @@ class LinkySensor(CoordinatorEntity[LinkyDataUpdateCoordinator], SensorEntity):
         return self.entity_description.available_fn(self.coordinator.data)
 
     @property
-    def native_value(self) -> int | float | None:
+    def native_value(self) -> int | float | None:  # type: ignore[override]
         """Return the state of the sensor."""
         if self.coordinator.data is None:
             return None
         return self.entity_description.value_fn(self.coordinator.data)
 
     @property
-    def extra_state_attributes(self) -> dict[str, Any] | None:
+    def extra_state_attributes(self) -> dict[str, Any] | None:  # type: ignore[override]
         """Return extra state attributes."""
         if self.coordinator.data is None:
             return None
@@ -209,19 +229,7 @@ class LinkySensor(CoordinatorEntity[LinkyDataUpdateCoordinator], SensorEntity):
         return self.entity_description.extra_state_fn(self.coordinator.data)
 
     @property
-    def last_reset(self) -> datetime | None:
-        """Return the time when the sensor was last reset."""
-        if self.coordinator.data is None:
-            return None
-        if self.entity_description.last_reset_fn is None:
-            return None
-        return self.entity_description.last_reset_fn(self.coordinator.data)
-        """Return the time when the sensor was last reset."""
-        if self.coordinator.data is None:
-            return None
-        if self.entity_description.last_reset_fn is None:
-            return None
-        return self.entity_description.last_reset_fn(self.coordinator.data)
+    def last_reset(self) -> datetime | None:  # type: ignore[override]
         """Return the time when the sensor was last reset."""
         if self.coordinator.data is None:
             return None

@@ -26,7 +26,7 @@ from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import EnergyConverter
 from pylinky import APIError, AsyncLinkyClient, AuthenticationError, MeteringData
 
-from .const import API_REQUEST_DELAY, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import API_REQUEST_DELAY, DOMAIN
 
 # Paris timezone for Linky data
 PARIS_TZ = dt_util.get_time_zone("Europe/Paris")
@@ -53,28 +53,103 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
 
     config_entry: ConfigEntry
 
+    # Default fetch period for first run or when no previous data exists
+    DEFAULT_FETCH_DAYS = 3
+
     def __init__(
         self,
         hass: HomeAssistant,
         client: AsyncLinkyClient,
+        scan_interval_hours: int = 6,
     ) -> None:
         """Initialize the coordinator."""
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=DEFAULT_SCAN_INTERVAL,
+            update_interval=timedelta(hours=scan_interval_hours),
         )
         self.client = client
+        # Track last known data dates to optimize API calls
+        self._last_consumption_date: date | None = None
+        self._last_load_curve_date: date | None = None
+        self._last_production_date: date | None = None
+
+    def _get_fetch_start_date(self, last_date: date | None) -> date:
+        """Calculate optimal start date for API fetch.
+
+        If we have previous data, start from the day after the last known date.
+        Otherwise, use the default fetch period.
+        We always fetch at least 1 day back from last_date to catch late updates.
+        """
+        today = date.today()
+
+        if last_date is None:
+            # First fetch: use default period
+            return today - timedelta(days=self.DEFAULT_FETCH_DAYS)
+
+        # Start from last known date (re-fetch it in case of late updates)
+        start = last_date
+
+        # But don't go back more than DEFAULT_FETCH_DAYS
+        min_start = today - timedelta(days=self.DEFAULT_FETCH_DAYS)
+        if start < min_start:
+            start = min_start
+
+        return start
+
+    def _update_last_dates(self, data: LinkyData) -> None:
+        """Update tracked last dates from fetched data."""
+        if data.daily_consumption and data.daily_consumption.interval_reading:
+            readings = data.daily_consumption.interval_reading
+            last_reading = max(readings, key=lambda r: r.date)
+            last_date = last_reading.date
+            if isinstance(last_date, datetime):
+                last_date = last_date.date()
+            self._last_consumption_date = last_date
+
+        if data.load_curve and data.load_curve.interval_reading:
+            readings = data.load_curve.interval_reading
+            last_reading = max(readings, key=lambda r: r.date)
+            last_date = last_reading.date
+            if isinstance(last_date, datetime):
+                last_date = last_date.date()
+            self._last_load_curve_date = last_date
+
+        if data.daily_production and data.daily_production.interval_reading:
+            readings = data.daily_production.interval_reading
+            last_reading = max(readings, key=lambda r: r.date)
+            last_date = last_reading.date
+            if isinstance(last_date, datetime):
+                last_date = last_date.date()
+            self._last_production_date = last_date
 
     async def _async_update_data(self) -> LinkyData:
         """Fetch data from Linky API."""
         data = LinkyData()
 
-        # Fetch data for the last 7 days to get recent consumption for sensors
-        # The API returns data up to yesterday typically
+        # Calculate optimal date range based on what we already have
+        # Use the oldest of our tracked dates as start to ensure we get all data types
         end = date.today()
-        start = end - timedelta(days=7)
+        start = self._get_fetch_start_date(
+            min(
+                filter(None, [
+                    self._last_consumption_date,
+                    self._last_load_curve_date,
+                    self._last_production_date,
+                ]),
+                default=None,
+            )
+        )
+
+        _LOGGER.debug(
+            "Fetching data from %s to %s (last known dates: consumption=%s, load_curve=%s, production=%s)",
+            start,
+            end,
+            self._last_consumption_date,
+            self._last_load_curve_date,
+            self._last_production_date,
+        )
 
         try:
             # Fetch consumption data with delays between requests
@@ -147,9 +222,12 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 load_curve=data.load_curve,
                 production_load_curve=data.production_load_curve,
             )
-        except KeyError:
-            # Recorder not available (e.g., in tests or if disabled)
-            _LOGGER.debug("Recorder not available, skipping statistics insertion")
+        except Exception as err:  # noqa: BLE001
+            # Recorder may not be available (e.g., in tests or if disabled)
+            _LOGGER.debug("Failed to insert statistics: %s", err)
+
+        # Update tracked dates for next fetch optimization
+        self._update_last_dates(data)
 
         return data
 
@@ -319,7 +397,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             await self._process_hourly_load_curve(
                 load_curve=load_curve,
                 statistic_id=consumption_hourly_id,
-                name=f"Linky {prm} Consommation journalière",
+                name=f"Linky {prm} hourly consumption",
             )
 
         # Process production load curve
@@ -327,7 +405,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             await self._process_hourly_load_curve(
                 load_curve=production_load_curve,
                 statistic_id=production_hourly_id,
-                name=f"Linky {prm} Production journalière",
+                name=f"Linky {prm} hourly production",
             )
 
     async def _process_hourly_load_curve(
@@ -375,7 +453,10 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         # - 01:30 belongs to hour 01:00 (interval 01:00-01:30)
         hourly_energy: dict[datetime, float] = defaultdict(float)
 
-        for reading in load_curve.interval_reading:
+        # Sort readings by date to ensure correct processing order
+        sorted_readings = sorted(load_curve.interval_reading, key=lambda r: r.date)
+
+        for reading in sorted_readings:
             reading_dt = reading.date
             if not isinstance(reading_dt, datetime):
                 # Skip if we don't have time information (shouldn't happen for load curve)
@@ -569,7 +650,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 await self._process_hourly_load_curve(
                     load_curve=load_curve,
                     statistic_id=f"{DOMAIN}:{prm}_energy_consumption_hourly",
-                    name=f"Linky {prm} Consommation journalière",
+                    name=f"Linky {prm} hourly consumption",
                 )
                 _LOGGER.info(
                     "Imported hourly consumption statistics from load curve (%s readings)",
@@ -590,7 +671,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 await self._process_hourly_load_curve(
                     load_curve=production_load_curve,
                     statistic_id=f"{DOMAIN}:{prm}_energy_production_hourly",
-                    name=f"Linky {prm} Production journalière",
+                    name=f"Linky {prm} hourly production",
                 )
                 _LOGGER.info(
                     "Imported hourly production statistics from load curve (%s readings)",

@@ -1,15 +1,25 @@
 """Config flow for Linky integration."""
 
+# pylint: disable=abstract-method
+
 from __future__ import annotations
 
 import logging
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_TOKEN
-from homeassistant.data_entry_flow import AbortFlow
+from homeassistant.core import callback
 from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -19,9 +29,49 @@ from homeassistant.helpers.selector import (
 )
 from pylinky import AsyncLinkyClient, InvalidTokenError, PRMAccessError
 
-from .const import CONF_PRM, DOMAIN
+from .const import (
+    CONF_PRM,
+    CONF_SCAN_INTERVAL,
+    DEFAULT_SCAN_INTERVAL_HOURS,
+    DOMAIN,
+    MAX_SCAN_INTERVAL_HOURS,
+    MIN_SCAN_INTERVAL_HOURS,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class LinkyOptionsFlow(OptionsFlow):
+    """Handle options flow for Linky."""
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current_interval = self.config_entry.options.get(
+            CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS
+        )
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_SCAN_INTERVAL,
+                        default=current_interval,
+                    ): NumberSelector(
+                        NumberSelectorConfig(
+                            min=MIN_SCAN_INTERVAL_HOURS,
+                            max=MAX_SCAN_INTERVAL_HOURS,
+                            step=1,
+                            mode=NumberSelectorMode.SLIDER,
+                            unit_of_measurement="h",
+                        )
+                    ),
+                }
+            ),
+        )
 
 
 class LinkyConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -29,14 +79,18 @@ class LinkyConfigFlow(ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> LinkyOptionsFlow:  # noqa: ARG004
+        """Get the options flow for this handler."""
+        return LinkyOptionsFlow()
+
     def __init__(self) -> None:
         """Initialize the config flow."""
         self._token: str | None = None
         self._prms: list[str] = []
 
-    async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Handle the initial step - token input."""
         errors: dict[str, str] = {}
 
@@ -57,8 +111,6 @@ class LinkyConfigFlow(ConfigFlow, domain=DOMAIN):
 
             except InvalidTokenError:
                 errors["base"] = "invalid_token"
-            except AbortFlow:
-                raise
             except (OSError, RuntimeError, ValueError) as err:
                 _LOGGER.exception("Unexpected error during token validation: %s", err)
                 errors["base"] = "unknown"

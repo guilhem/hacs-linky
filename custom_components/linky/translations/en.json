@@ -25,6 +25,35 @@
       "already_configured": "This meter is already configured"
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Linky Options",
+        "data": {
+          "scan_interval": "Update interval"
+        },
+        "data_description": {
+          "scan_interval": "How often to fetch data (in hours). Linky data has a 24-48h delay."
+        }
+      }
+    }
+  },
+  "services": {
+    "import_historical_data": {
+      "name": "Import historical data",
+      "description": "Import historical consumption and production data from a specific date",
+      "fields": {
+        "start_date": {
+          "name": "Start date",
+          "description": "Start date for data import (YYYY-MM-DD)"
+        },
+        "end_date": {
+          "name": "End date",
+          "description": "End date for import (YYYY-MM-DD). Default: today"
+        }
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "daily_consumption": {

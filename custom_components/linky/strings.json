@@ -25,6 +25,19 @@
       "already_configured": "Ce compteur est déjà configuré"
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options Linky",
+        "data": {
+          "scan_interval": "Intervalle de mise à jour"
+        },
+        "data_description": {
+          "scan_interval": "Fréquence de récupération des données (en heures). Les données Linky ont un délai de 24-48h."
+        }
+      }
+    }
+  },
   "services": {
     "import_historical_data": {
       "name": "Importer l'historique",
