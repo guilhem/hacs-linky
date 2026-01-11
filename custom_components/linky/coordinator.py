@@ -83,10 +83,11 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         """
         prm = self.client.prm
         updates: list[tuple[str, str]] = [
-            (f"{DOMAIN}:{prm}_energy_consumption", f"Linky {prm} consumption"),
-            (f"{DOMAIN}:{prm}_energy_production", f"Linky {prm} production"),
-            (f"{DOMAIN}:{prm}_energy_consumption_hourly", f"Linky {prm} hourly consumption"),
-            (f"{DOMAIN}:{prm}_energy_production_hourly", f"Linky {prm} hourly production"),
+            # Keep only kWh-based statistics (Energy Dashboard friendly)
+            (f"{DOMAIN}:{prm}_energy_consumption_kwh", f"Linky {prm} consumption"),
+            (f"{DOMAIN}:{prm}_energy_production_kwh", f"Linky {prm} production"),
+            (f"{DOMAIN}:{prm}_energy_consumption_hourly_kwh", f"Linky {prm} hourly consumption"),
+            (f"{DOMAIN}:{prm}_energy_production_hourly_kwh", f"Linky {prm} hourly production"),
         ]
 
         for statistic_id, name in updates:
@@ -98,7 +99,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 source=DOMAIN,
                 statistic_id=statistic_id,
                 unit_class=EnergyConverter.UNIT_CLASS,
-                unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+                unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
             )
             # Passing an empty statistics list hints recorder to update metadata if needed
             async_add_external_statistics(self.hass, metadata, [])
@@ -276,9 +277,9 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         """
         prm = self.client.prm
 
-        # Define statistic IDs
-        consumption_statistic_id = f"{DOMAIN}:{prm}_energy_consumption"
-        production_statistic_id = f"{DOMAIN}:{prm}_energy_production"
+        # Define statistic IDs (kWh variants for Energy Dashboard pricing compatibility)
+        consumption_statistic_id = f"{DOMAIN}:{prm}_energy_consumption_kwh"
+        production_statistic_id = f"{DOMAIN}:{prm}_energy_production_kwh"
 
         _LOGGER.debug(
             "Updating statistics for consumption: %s and production: %s",
@@ -286,7 +287,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             production_statistic_id,
         )
 
-        # Metadata for consumption statistics
+        # Metadata for consumption statistics (kWh)
         consumption_metadata = StatisticMetaData(
             mean_type=StatisticMeanType.NONE,
             has_sum=True,
@@ -294,10 +295,10 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             source=DOMAIN,
             statistic_id=consumption_statistic_id,
             unit_class=EnergyConverter.UNIT_CLASS,
-            unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         )
 
-        # Metadata for production statistics
+        # Metadata for production statistics (kWh)
         production_metadata = StatisticMetaData(
             mean_type=StatisticMeanType.NONE,
             has_sum=True,
@@ -305,7 +306,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             source=DOMAIN,
             statistic_id=production_statistic_id,
             unit_class=EnergyConverter.UNIT_CLASS,
-            unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         )
 
         # Get last statistics to determine starting point
@@ -350,8 +351,8 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 if last_stats_time and stat_time.timestamp() <= last_stats_time:
                     continue
 
-                # Value in Wh
-                consumption_state = float(reading.value)
+                # Convert Wh -> kWh
+                consumption_state = float(reading.value) / 1000.0
                 consumption_sum += consumption_state
 
                 consumption_statistics.append(
@@ -375,8 +376,8 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 if last_stats_time and stat_time.timestamp() <= last_stats_time:
                     continue
 
-                # Value in Wh
-                production_state = float(reading.value)
+                # Convert Wh -> kWh
+                production_state = float(reading.value) / 1000.0
                 production_sum += production_state
 
                 production_statistics.append(
@@ -417,9 +418,9 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
 
         prm = self.client.prm
 
-        # Define statistic IDs for hourly data
-        consumption_hourly_id = f"{DOMAIN}:{prm}_energy_consumption_hourly"
-        production_hourly_id = f"{DOMAIN}:{prm}_energy_production_hourly"
+        # Define statistic IDs for hourly data (kWh)
+        consumption_hourly_id = f"{DOMAIN}:{prm}_energy_consumption_hourly_kwh"
+        production_hourly_id = f"{DOMAIN}:{prm}_energy_production_hourly_kwh"
 
         _LOGGER.debug(
             "Updating hourly statistics for consumption: %s and production: %s",
@@ -457,7 +458,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
 
         We convert W to Wh (power * 0.5h) and aggregate to hourly statistics.
         """
-        # Metadata for hourly statistics
+        # Metadata for hourly statistics (kWh)
         metadata = StatisticMetaData(
             mean_type=StatisticMeanType.NONE,
             has_sum=True,
@@ -465,7 +466,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             source=DOMAIN,
             statistic_id=statistic_id,
             unit_class=EnergyConverter.UNIT_CLASS,
-            unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         )
 
         # Get last statistics to determine starting point
@@ -512,7 +513,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
 
             # Convert power (W) to energy (Wh): W * 0.5h = Wh
             energy_wh = reading.value * 0.5
-            hourly_energy[hour_start] += energy_wh
+            hourly_energy[hour_start] += energy_wh / 1000.0  # store in kWh
 
         # Create statistics from hourly aggregated data
         statistics = []
@@ -524,13 +525,13 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             if last_stats_time and stat_time.timestamp() <= last_stats_time:
                 continue
 
-            energy_wh = hourly_energy[hour_start]
-            energy_sum += energy_wh
+            energy_kwh = hourly_energy[hour_start]
+            energy_sum += energy_kwh
 
             statistics.append(
                 StatisticData(
                     start=stat_time,
-                    state=energy_wh,
+                    state=energy_kwh,
                     sum=energy_sum,
                 )
             )
@@ -550,11 +551,11 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
 
         prm = self.client.prm
 
-        # Define statistic IDs
-        consumption_statistic_id = f"{DOMAIN}:{prm}_energy_consumption"
-        production_statistic_id = f"{DOMAIN}:{prm}_energy_production"
+        # Define statistic IDs (kWh variants for Energy Dashboard pricing compatibility)
+        consumption_statistic_id = f"{DOMAIN}:{prm}_energy_consumption_kwh"
+        production_statistic_id = f"{DOMAIN}:{prm}_energy_production_kwh"
 
-        # Metadata for consumption statistics
+        # Metadata for consumption statistics (kWh)
         consumption_metadata = StatisticMetaData(
             mean_type=StatisticMeanType.NONE,
             has_sum=True,
@@ -562,10 +563,10 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             source=DOMAIN,
             statistic_id=consumption_statistic_id,
             unit_class=EnergyConverter.UNIT_CLASS,
-            unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         )
 
-        # Metadata for production statistics
+        # Metadata for production statistics (kWh)
         production_metadata = StatisticMetaData(
             mean_type=StatisticMeanType.NONE,
             has_sum=True,
@@ -573,7 +574,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             source=DOMAIN,
             statistic_id=production_statistic_id,
             unit_class=EnergyConverter.UNIT_CLASS,
-            unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         )
 
         # Get last statistics to calculate proper sum
@@ -610,8 +611,8 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                     stat_time = datetime.combine(reading_date, datetime.min.time())
                     stat_time = dt_util.as_utc(stat_time)
 
-                    # Value in Wh
-                    consumption_state = float(reading.value)
+                    # Convert Wh -> kWh
+                    consumption_state = float(reading.value) / 1000.0
                     consumption_sum += consumption_state
 
                     consumption_statistics.append(
@@ -639,8 +640,8 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                     stat_time = datetime.combine(reading_date, datetime.min.time())
                     stat_time = dt_util.as_utc(stat_time)
 
-                    # Value in Wh
-                    production_state = float(reading.value)
+                    # Convert Wh -> kWh
+                    production_state = float(reading.value) / 1000.0
                     production_sum += production_state
 
                     production_statistics.append(
@@ -679,14 +680,14 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         """Import hourly statistics from load curve data for a date range."""
         prm = self.client.prm
 
-        # Fetch and process consumption load curve
+        # Fetch and process consumption load curve (kWh)
         try:
             await asyncio.sleep(API_REQUEST_DELAY)
             load_curve = await self.client.get_consumption_load_curve(start=start, end=end)
             if load_curve and load_curve.interval_reading:
                 await self._process_hourly_load_curve(
                     load_curve=load_curve,
-                    statistic_id=f"{DOMAIN}:{prm}_energy_consumption_hourly",
+                    statistic_id=f"{DOMAIN}:{prm}_energy_consumption_hourly_kwh",
                     name=f"Linky {prm} hourly consumption",
                 )
                 _LOGGER.info(
@@ -698,7 +699,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         except APIError as err:
             _LOGGER.debug("Failed to fetch consumption load curve for import: %s", err)
 
-        # Fetch and process production load curve
+        # Fetch and process production load curve (kWh)
         try:
             await asyncio.sleep(API_REQUEST_DELAY)
             production_load_curve = await self.client.get_production_load_curve(
@@ -707,7 +708,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             if production_load_curve and production_load_curve.interval_reading:
                 await self._process_hourly_load_curve(
                     load_curve=production_load_curve,
-                    statistic_id=f"{DOMAIN}:{prm}_energy_production_hourly",
+                    statistic_id=f"{DOMAIN}:{prm}_energy_production_hourly_kwh",
                     name=f"Linky {prm} hourly production",
                 )
                 _LOGGER.info(
