@@ -57,6 +57,7 @@ Pour importer des données historiques au-delà des 365 derniers jours automatiq
 Les données historiques seront importées et ajoutées aux statistiques existantes.
 
 **Exemple YAML :**
+
 ```yaml
 service: linky.import_historical_data
 data:
@@ -71,7 +72,7 @@ data:
 ### Sensors
 
 | Entité | Description | Unité |
-|--------|-------------|-------|
+| ------ | ----------- | ----- |
 | `sensor.linky_XXXXXX_daily_consumption` | Dernière consommation journalière | Wh |
 | `sensor.linky_XXXXXX_total_consumption_week` | Total sur 7 jours | Wh |
 | `sensor.linky_XXXXXX_current_power` | Puissance moyenne (30 min) | W |
