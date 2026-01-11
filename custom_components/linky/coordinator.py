@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -26,6 +27,9 @@ from homeassistant.util.unit_conversion import EnergyConverter
 from pylinky import APIError, AsyncLinkyClient, AuthenticationError, MeteringData
 
 from .const import API_REQUEST_DELAY, DEFAULT_SCAN_INTERVAL, DOMAIN
+
+# Paris timezone for Linky data
+PARIS_TZ = dt_util.get_time_zone("Europe/Paris")
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -137,6 +141,11 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             await self._insert_statistics(
                 daily_consumption=data.daily_consumption,
                 daily_production=data.daily_production,
+            )
+            # Insert hourly statistics from load curve data
+            await self._insert_hourly_statistics(
+                load_curve=data.load_curve,
+                production_load_curve=data.production_load_curve,
             )
         except KeyError:
             # Recorder not available (e.g., in tests or if disabled)
@@ -280,6 +289,144 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             )
             async_add_external_statistics(self.hass, production_metadata, production_statistics)
 
+    async def _insert_hourly_statistics(
+        self,
+        load_curve: MeteringData | None = None,
+        production_load_curve: MeteringData | None = None,
+    ) -> None:
+        """Insert hourly statistics from load curve data.
+
+        The load curve provides 30-minute interval data in Watts (average power).
+        We convert this to Wh and aggregate to hourly statistics for the Energy dashboard.
+        """
+        if load_curve is None and production_load_curve is None:
+            return
+
+        prm = self.client.prm
+
+        # Define statistic IDs for hourly data
+        consumption_hourly_id = f"{DOMAIN}:{prm}_energy_consumption_hourly"
+        production_hourly_id = f"{DOMAIN}:{prm}_energy_production_hourly"
+
+        _LOGGER.debug(
+            "Updating hourly statistics for consumption: %s and production: %s",
+            consumption_hourly_id,
+            production_hourly_id,
+        )
+
+        # Process consumption load curve
+        if load_curve and load_curve.interval_reading:
+            await self._process_hourly_load_curve(
+                load_curve=load_curve,
+                statistic_id=consumption_hourly_id,
+                name=f"Linky {prm} Consommation journalière",
+            )
+
+        # Process production load curve
+        if production_load_curve and production_load_curve.interval_reading:
+            await self._process_hourly_load_curve(
+                load_curve=production_load_curve,
+                statistic_id=production_hourly_id,
+                name=f"Linky {prm} Production journalière",
+            )
+
+    async def _process_hourly_load_curve(
+        self,
+        load_curve: MeteringData,
+        statistic_id: str,
+        name: str,
+    ) -> None:
+        """Process load curve data and insert hourly statistics.
+
+        The load curve provides 30-minute interval data in Watts (average power).
+        The timestamp represents the END of the interval.
+        So "2024-01-01 00:30:00" means data from 00:00 to 00:30.
+
+        We convert W to Wh (power * 0.5h) and aggregate to hourly statistics.
+        """
+        # Metadata for hourly statistics
+        metadata = StatisticMetaData(
+            mean_type=StatisticMeanType.NONE,
+            has_sum=True,
+            name=name,
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_class=EnergyConverter.UNIT_CLASS,
+            unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        )
+
+        # Get last statistics to determine starting point
+        last_stat = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, True, set()
+        )
+
+        if not last_stat:
+            energy_sum = 0.0
+            last_stats_time = None
+        else:
+            last_stats_time = last_stat[statistic_id][0]["start"]
+            energy_sum = float(last_stat[statistic_id][0].get("sum", 0))
+
+        # Aggregate 30-min readings to hourly
+        # Group readings by the hour they belong to
+        # The timestamp is the END of the interval, so:
+        # - 00:30 belongs to hour 00:00 (interval 00:00-00:30)
+        # - 01:00 belongs to hour 00:00 (interval 00:30-01:00)
+        # - 01:30 belongs to hour 01:00 (interval 01:00-01:30)
+        hourly_energy: dict[datetime, float] = defaultdict(float)
+
+        for reading in load_curve.interval_reading:
+            reading_dt = reading.date
+            if not isinstance(reading_dt, datetime):
+                # Skip if we don't have time information (shouldn't happen for load curve)
+                _LOGGER.debug("Skipping reading without time info: %s", reading_dt)
+                continue
+
+            # The timestamp is the END of the 30-min interval
+            # Get the START of the interval by subtracting 30 minutes
+            interval_start = reading_dt - timedelta(minutes=30)
+
+            # Get the hour this interval belongs to (truncate to hour)
+            # Use Paris timezone for the hour calculation
+            if interval_start.tzinfo is None:
+                interval_start = interval_start.replace(tzinfo=PARIS_TZ)
+
+            hour_start = interval_start.replace(minute=0, second=0, microsecond=0)
+
+            # Convert power (W) to energy (Wh): W * 0.5h = Wh
+            energy_wh = reading.value * 0.5
+            hourly_energy[hour_start] += energy_wh
+
+        # Create statistics from hourly aggregated data
+        statistics = []
+
+        for hour_start in sorted(hourly_energy.keys()):
+            stat_time = dt_util.as_utc(hour_start)
+
+            # Skip if we already have this statistic
+            if last_stats_time and stat_time.timestamp() <= last_stats_time:
+                continue
+
+            energy_wh = hourly_energy[hour_start]
+            energy_sum += energy_wh
+
+            statistics.append(
+                StatisticData(
+                    start=stat_time,
+                    state=energy_wh,
+                    sum=energy_sum,
+                )
+            )
+
+        # Add statistics to Home Assistant
+        if statistics:
+            _LOGGER.debug(
+                "Adding %s hourly statistics for %s",
+                len(statistics),
+                statistic_id,
+            )
+            async_add_external_statistics(self.hass, metadata, statistics)
+
     async def import_statistics(self, start: date, end: date) -> None:
         """Import statistics for a custom date range."""
         _LOGGER.info("Starting import of statistics from %s to %s", start, end)
@@ -406,3 +553,50 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 len(production_statistics),
             )
             async_add_external_statistics(self.hass, production_metadata, production_statistics)
+
+        # Also import hourly statistics from load curve
+        await self._import_hourly_statistics(start=start, end=end)
+
+    async def _import_hourly_statistics(self, start: date, end: date) -> None:
+        """Import hourly statistics from load curve data for a date range."""
+        prm = self.client.prm
+
+        # Fetch and process consumption load curve
+        try:
+            await asyncio.sleep(API_REQUEST_DELAY)
+            load_curve = await self.client.get_consumption_load_curve(start=start, end=end)
+            if load_curve and load_curve.interval_reading:
+                await self._process_hourly_load_curve(
+                    load_curve=load_curve,
+                    statistic_id=f"{DOMAIN}:{prm}_energy_consumption_hourly",
+                    name=f"Linky {prm} Consommation journalière",
+                )
+                _LOGGER.info(
+                    "Imported hourly consumption statistics from load curve (%s readings)",
+                    len(load_curve.interval_reading),
+                )
+        except AuthenticationError:
+            raise
+        except APIError as err:
+            _LOGGER.debug("Failed to fetch consumption load curve for import: %s", err)
+
+        # Fetch and process production load curve
+        try:
+            await asyncio.sleep(API_REQUEST_DELAY)
+            production_load_curve = await self.client.get_production_load_curve(
+                start=start, end=end
+            )
+            if production_load_curve and production_load_curve.interval_reading:
+                await self._process_hourly_load_curve(
+                    load_curve=production_load_curve,
+                    statistic_id=f"{DOMAIN}:{prm}_energy_production_hourly",
+                    name=f"Linky {prm} Production journalière",
+                )
+                _LOGGER.info(
+                    "Imported hourly production statistics from load curve (%s readings)",
+                    len(production_load_curve.interval_reading),
+                )
+        except AuthenticationError:
+            raise
+        except APIError as err:
+            _LOGGER.debug("Failed to fetch production load curve for import: %s", err)
