@@ -46,6 +46,9 @@ class LinkyData:
     max_power: MeteringData | None = None
     daily_production: MeteringData | None = None
     production_load_curve: MeteringData | None = None
+    # Aggregated sums in kWh for entity-backed sensors
+    consumption_kwh_sum: float | None = None
+    production_kwh_sum: float | None = None
 
 
 class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
@@ -265,6 +268,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         # Insert statistics using the data we already fetched (no extra API calls)
         try:
             await self._insert_statistics(
+                linky_data=data,
                 daily_consumption=data.daily_consumption,
                 daily_production=data.daily_production,
             )
@@ -284,6 +288,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
 
     async def _insert_statistics(
         self,
+        linky_data: LinkyData,
         daily_consumption: MeteringData | None = None,
         daily_production: MeteringData | None = None,
     ) -> None:
@@ -411,6 +416,8 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 len(consumption_statistics),
             )
             async_add_external_statistics(self.hass, consumption_metadata, consumption_statistics)
+            # Update aggregate kWh sum for entity sensor
+            linky_data.consumption_kwh_sum = consumption_sum
 
         if production_statistics:
             _LOGGER.debug(
@@ -418,6 +425,8 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 len(production_statistics),
             )
             async_add_external_statistics(self.hass, production_metadata, production_statistics)
+            # Update aggregate kWh sum for entity sensor
+            linky_data.production_kwh_sum = production_sum
 
     async def _insert_hourly_statistics(
         self,

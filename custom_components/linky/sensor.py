@@ -78,6 +78,16 @@ def _get_last_reading_attrs(data: LinkyData, attr: str) -> dict[str, Any]:
 
 
 SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
+    # Total consumption in kWh (entity-backed for Energy pricing)
+    LinkySensorEntityDescription(
+        key="total_consumption_kwh",
+        translation_key="total_consumption_kwh",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        value_fn=lambda data: data.consumption_kwh_sum,
+        available_fn=lambda data: data.consumption_kwh_sum is not None,
+    ),
     LinkySensorEntityDescription(
         key="daily_consumption",
         translation_key="daily_consumption",
@@ -100,6 +110,17 @@ SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
             if data.daily_consumption and data.daily_consumption.interval_reading
             else None
         ),
+    ),
+    # Total production in kWh (entity-backed)
+    LinkySensorEntityDescription(
+        key="total_production_kwh",
+        translation_key="total_production_kwh",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        value_fn=lambda data: data.production_kwh_sum,
+        available_fn=lambda data: data.production_kwh_sum is not None,
+        entity_registry_enabled_default=False,
     ),
     LinkySensorEntityDescription(
         key="current_power",
