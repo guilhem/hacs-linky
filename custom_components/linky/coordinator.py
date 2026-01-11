@@ -123,6 +123,84 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 seed = StatisticData(start=seed_time, state=0.0, sum=0.0)
                 async_add_external_statistics(self.hass, metadata, [seed])
 
+        # Also seed entity-backed statistic IDs so Energy can attach pricing immediately
+        unique_id = self.config_entry.unique_id or self.client.prm
+        entity_ids = [
+            f"sensor.linky_{unique_id}_total_consumption_kwh",
+            f"sensor.linky_{unique_id}_total_production_kwh",
+        ]
+
+        for entity_stat_id in entity_ids:
+            ent_meta = StatisticMetaData(
+                mean_type=StatisticMeanType.NONE,
+                has_sum=True,
+                name=entity_stat_id.split(".", 1)[1].replace("_", " "),
+                source=DOMAIN,
+                statistic_id=entity_stat_id,
+                unit_class=EnergyConverter.UNIT_CLASS,
+                unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            )
+            async_add_external_statistics(self.hass, ent_meta, [])
+            last_ent = await get_instance(self.hass).async_add_executor_job(
+                get_last_statistics, self.hass, 1, entity_stat_id, True, set()
+            )
+            if not last_ent:
+                seed_time = datetime.combine(utcnow.date(), datetime.min.time())
+                seed_time = dt_util.as_utc(seed_time)
+                async_add_external_statistics(
+                    self.hass, ent_meta, [StatisticData(start=seed_time, state=0.0, sum=0.0)]
+                )
+
+    async def async_cleanup_legacy_statistics(self) -> None:
+        """Remove legacy Wh statistics so they no longer appear in UI.
+
+        Best-effort: tries recorder's delete API; logs and continues if unsupported.
+        """
+        prm = self.client.prm
+        legacy_ids = [
+            f"{DOMAIN}:{prm}_energy_consumption",
+            f"{DOMAIN}:{prm}_energy_production",
+            f"{DOMAIN}:{prm}_energy_consumption_hourly",
+            f"{DOMAIN}:{prm}_energy_production_hourly",
+        ]
+
+        try:
+            # Dynamic import to avoid static type complaints across HA versions
+            import inspect  # pylint: disable=import-outside-toplevel
+            from importlib import (
+                import_module,  # pylint: disable=import-outside-toplevel
+            )
+
+            stats_mod = import_module("homeassistant.components.recorder.statistics")
+            delete_fn = None
+            for name in (
+                "delete_statistics",
+                "clear_statistics",
+                "async_delete_statistics",
+                "async_clear_statistics",
+            ):
+                delete_fn = getattr(stats_mod, name, None)
+                if delete_fn:
+                    break
+
+            if not delete_fn:
+                _LOGGER.debug("Recorder delete API not available; skip legacy cleanup")
+                return
+
+            for stat_id in legacy_ids:
+                try:
+                    if inspect.iscoroutinefunction(delete_fn):
+                        await delete_fn(self.hass, stat_id)  # type: ignore[misc]
+                    else:
+                        await get_instance(self.hass).async_add_executor_job(
+                            delete_fn, self.hass, stat_id
+                        )
+                    _LOGGER.info("Deleted legacy statistics: %s", stat_id)
+                except Exception as err:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+                    _LOGGER.debug("Failed to delete %s: %s", stat_id, err)
+        except Exception as err:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            _LOGGER.debug("Legacy cleanup failed to initialize: %s", err)
+
     def _get_fetch_start_date(self, last_date: date | None) -> date:
         """Calculate optimal start date for API fetch.
 
@@ -416,8 +494,6 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 len(consumption_statistics),
             )
             async_add_external_statistics(self.hass, consumption_metadata, consumption_statistics)
-            # Update aggregate kWh sum for entity sensor
-            linky_data.consumption_kwh_sum = consumption_sum
 
         if production_statistics:
             _LOGGER.debug(
@@ -425,8 +501,10 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 len(production_statistics),
             )
             async_add_external_statistics(self.hass, production_metadata, production_statistics)
-            # Update aggregate kWh sum for entity sensor
-            linky_data.production_kwh_sum = production_sum
+
+        # Update aggregate kWh sums for entity sensors even if no new points
+        linky_data.consumption_kwh_sum = consumption_sum
+        linky_data.production_kwh_sum = production_sum
 
     async def _insert_hourly_statistics(
         self,
@@ -742,5 +820,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 )
         except AuthenticationError:
             raise
+        except APIError as err:
+            _LOGGER.debug("Failed to fetch production load curve for import: %s", err)
         except APIError as err:
             _LOGGER.debug("Failed to fetch production load curve for import: %s", err)
