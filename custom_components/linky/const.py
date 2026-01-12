@@ -9,6 +9,7 @@ DOMAIN: Final = "linky"
 CONF_TOKEN: Final = "token"
 CONF_PRM: Final = "prm"
 CONF_SCAN_INTERVAL: Final = "scan_interval"
+CONF_PRICE_ENTITY: Final = "price_entity"
 
 # Default values
 DEFAULT_SCAN_INTERVAL_HOURS: Final = 6

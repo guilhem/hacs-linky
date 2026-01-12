@@ -26,7 +26,7 @@ from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import EnergyConverter
 from pylinky import APIError, AsyncLinkyClient, AuthenticationError, MeteringData
 
-from .const import API_REQUEST_DELAY, DOMAIN
+from .const import API_REQUEST_DELAY, CONF_PRICE_ENTITY, DOMAIN
 
 # Paris timezone for Linky data
 PARIS_TZ = dt_util.get_time_zone("Europe/Paris")
@@ -46,9 +46,6 @@ class LinkyData:
     max_power: MeteringData | None = None
     daily_production: MeteringData | None = None
     production_load_curve: MeteringData | None = None
-    # Aggregated sums in kWh for entity-backed sensors
-    consumption_kwh_sum: float | None = None
-    production_kwh_sum: float | None = None
 
 
 class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
@@ -77,8 +74,6 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         self._last_consumption_date: date | None = None
         self._last_load_curve_date: date | None = None
         self._last_production_date: date | None = None
-
-    
 
     def _get_fetch_start_date(self, last_date: date | None) -> date:
         """Calculate optimal start date for API fetch.
@@ -222,168 +217,57 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         if data.daily_consumption is None and data.load_curve is None and data.max_power is None:
             raise UpdateFailed("Failed to fetch any consumption data from API")
 
-        # Insert statistics using the data we already fetched (no extra API calls)
+        # Insert hourly statistics from load curve data for granular history
         try:
-            await self._insert_statistics(
-                linky_data=data,
-                daily_consumption=data.daily_consumption,
-                daily_production=data.daily_production,
-            )
-            # Insert hourly statistics from load curve data
             await self._insert_hourly_statistics(
                 load_curve=data.load_curve,
                 production_load_curve=data.production_load_curve,
             )
         except Exception as err:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             # Recorder may not be available (e.g., in tests or if disabled)
-            _LOGGER.debug("Failed to insert statistics: %s", err)
+            _LOGGER.debug("Failed to insert hourly statistics: %s", err)
 
         # Update tracked dates for next fetch optimization
         self._update_last_dates(data)
 
         return data
 
-    async def _insert_statistics(
-        self,
-        linky_data: LinkyData,
-        daily_consumption: MeteringData | None = None,
-        daily_production: MeteringData | None = None,
-    ) -> None:
-        """Insert Linky statistics for daily consumption and production.
+    def _get_price_info(self) -> tuple[float, str] | None:
+        """Get price value and currency from the configured price entity.
 
-        Uses data already fetched by _async_update_data to avoid duplicate API calls.
+        Returns a tuple of (price, currency) or None if not configured or unavailable.
         """
-        prm = self.client.prm
+        price_entity_id = self.config_entry.options.get(CONF_PRICE_ENTITY)
+        if not price_entity_id:
+            return None
 
-        # Define statistic IDs (kWh variants for Energy Dashboard pricing compatibility)
-        consumption_statistic_id = f"{DOMAIN}:{prm}_energy_consumption_kwh"
-        production_statistic_id = f"{DOMAIN}:{prm}_energy_production_kwh"
+        price_state = self.hass.states.get(price_entity_id)
+        if price_state is None:
+            _LOGGER.debug("Price entity %s not found", price_entity_id)
+            return None
 
-        _LOGGER.debug(
-            "Updating statistics for consumption: %s and production: %s",
-            consumption_statistic_id,
-            production_statistic_id,
-        )
+        if price_state.state in (None, "unknown", "unavailable"):
+            _LOGGER.debug("Price entity %s is unavailable", price_entity_id)
+            return None
 
-        # Metadata for consumption statistics (kWh)
-        consumption_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            has_sum=True,
-            name=f"Linky {prm} consumption",
-            source=DOMAIN,
-            statistic_id=consumption_statistic_id,
-            unit_class=EnergyConverter.UNIT_CLASS,
-            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        )
-
-        # Metadata for production statistics (kWh)
-        production_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            has_sum=True,
-            name=f"Linky {prm} production",
-            source=DOMAIN,
-            statistic_id=production_statistic_id,
-            unit_class=EnergyConverter.UNIT_CLASS,
-            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        )
-
-        # Get last statistics to determine starting point
-        last_stat = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, consumption_statistic_id, True, set()
-        )
-
-        # Determine if this is first time or incremental update
-        if not last_stat:
-            _LOGGER.debug("Updating statistics for the first time")
-            consumption_sum = 0.0
-            production_sum = 0.0
-            last_stats_time = None
-        else:
-            # Get info about last statistic
-            row = last_stat.get(consumption_statistic_id, [{}])[0]
-            last_stats_time = row.get("start")  # type: ignore[assignment]
-
-            # Get current sum from last statistic
-            consumption_sum = float(row.get("sum") or 0)
-
-            # Get production sum if exists
-            last_prod_stat = await get_instance(self.hass).async_add_executor_job(
-                get_last_statistics, self.hass, 1, production_statistic_id, True, set()
+        try:
+            price = float(price_state.state)
+        except ValueError:
+            _LOGGER.warning(
+                "Price entity %s has invalid value: %s",
+                price_entity_id,
+                price_state.state,
             )
-            if last_prod_stat:
-                prod_row = last_prod_stat.get(production_statistic_id, [{}])[0]
-                production_sum = float(prod_row.get("sum") or 0)
-            else:
-                production_sum = 0.0
+            return None
 
-        # Process consumption data (already fetched by _async_update_data)
-        consumption_statistics = []
-        if daily_consumption and daily_consumption.interval_reading:
-            for reading in daily_consumption.interval_reading:
-                reading_date = reading.date
-                # Convert date to datetime at midnight UTC
-                stat_time = datetime.combine(reading_date, datetime.min.time())
-                stat_time = dt_util.as_utc(stat_time)
+        # Get currency from unit_of_measurement (e.g., "EUR/kWh", "USD/kWh")
+        unit = price_state.attributes.get("unit_of_measurement", "")
+        # Extract currency from unit like "EUR/kWh" -> "EUR"
+        currency = (
+            unit.split("/")[0].strip() if "/" in unit else unit if unit else "EUR"
+        )
 
-                # Skip if we already have this statistic
-                if last_stats_time and stat_time.timestamp() <= last_stats_time:
-                    continue
-
-                # Convert Wh -> kWh
-                consumption_state = float(reading.value) / 1000.0
-                consumption_sum += consumption_state
-
-                consumption_statistics.append(
-                    StatisticData(
-                        start=stat_time,
-                        state=consumption_state,
-                        sum=consumption_sum,
-                    )
-                )
-
-        # Process production data (already fetched by _async_update_data)
-        production_statistics = []
-        if daily_production and daily_production.interval_reading:
-            for reading in daily_production.interval_reading:
-                reading_date = reading.date
-                # Convert date to datetime at midnight UTC
-                stat_time = datetime.combine(reading_date, datetime.min.time())
-                stat_time = dt_util.as_utc(stat_time)
-
-                # Skip if we already have this statistic
-                if last_stats_time and stat_time.timestamp() <= last_stats_time:
-                    continue
-
-                # Convert Wh -> kWh
-                production_state = float(reading.value) / 1000.0
-                production_sum += production_state
-
-                production_statistics.append(
-                    StatisticData(
-                        start=stat_time,
-                        state=production_state,
-                        sum=production_sum,
-                    )
-                )
-
-        # Add statistics to Home Assistant
-        if consumption_statistics:
-            _LOGGER.debug(
-                "Adding %s consumption statistics",
-                len(consumption_statistics),
-            )
-            async_add_external_statistics(self.hass, consumption_metadata, consumption_statistics)
-
-        if production_statistics:
-            _LOGGER.debug(
-                "Adding %s production statistics",
-                len(production_statistics),
-            )
-            async_add_external_statistics(self.hass, production_metadata, production_statistics)
-
-        # Update aggregate kWh sums for entity sensors even if no new points
-        linky_data.consumption_kwh_sum = consumption_sum
-        linky_data.production_kwh_sum = production_sum
+        return (price, currency)
 
     async def _insert_hourly_statistics(
         self,
@@ -400,6 +284,9 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
 
         prm = self.client.prm
 
+        # Get price info if configured
+        price_info = self._get_price_info()
+
         # Define statistic IDs for hourly data (kWh)
         consumption_hourly_id = f"{DOMAIN}:{prm}_energy_consumption_hourly_kwh"
         production_hourly_id = f"{DOMAIN}:{prm}_energy_production_hourly_kwh"
@@ -410,15 +297,19 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             production_hourly_id,
         )
 
-        # Process consumption load curve
+        # Process consumption load curve (with cost if price is configured)
         if load_curve and load_curve.interval_reading:
+            cost_id = f"{DOMAIN}:{prm}_energy_consumption_hourly_cost"
             await self._process_hourly_load_curve(
                 load_curve=load_curve,
                 statistic_id=consumption_hourly_id,
                 name=f"Linky {prm} hourly consumption",
+                price_info=price_info,
+                cost_statistic_id=cost_id,
+                cost_name=f"Linky {prm} hourly consumption cost",
             )
 
-        # Process production load curve
+        # Process production load curve (no cost for production)
         if production_load_curve and production_load_curve.interval_reading:
             await self._process_hourly_load_curve(
                 load_curve=production_load_curve,
@@ -431,6 +322,9 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         load_curve: MeteringData,
         statistic_id: str,
         name: str,
+        price_info: tuple[float, str] | None = None,
+        cost_statistic_id: str | None = None,
+        cost_name: str | None = None,
     ) -> None:
         """Process load curve data and insert hourly statistics.
 
@@ -439,6 +333,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         So "2024-01-01 00:30:00" means data from 00:00 to 00:30.
 
         We convert W to Wh (power * 0.5h) and aggregate to hourly statistics.
+        If price_info is provided, also creates cost statistics.
         """
         # Metadata for hourly statistics (kWh)
         metadata = StatisticMetaData(
@@ -463,6 +358,16 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             row = last_stat.get(statistic_id, [{}])[0]
             last_stats_time = row.get("start")  # type: ignore[assignment]
             energy_sum = float(row.get("sum") or 0)
+
+        # If we have price info, also get last cost statistics
+        cost_sum = 0.0
+        if price_info and cost_statistic_id:
+            last_cost_stat = await get_instance(self.hass).async_add_executor_job(
+                get_last_statistics, self.hass, 1, cost_statistic_id, True, set()
+            )
+            if last_cost_stat:
+                cost_row = last_cost_stat.get(cost_statistic_id, [{}])[0]
+                cost_sum = float(cost_row.get("sum") or 0)
 
         # Aggregate 30-min readings to hourly
         # Group readings by the hour they belong to
@@ -499,6 +404,8 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
 
         # Create statistics from hourly aggregated data
         statistics = []
+        cost_statistics = []
+        price = price_info[0] if price_info else 0.0
 
         for hour_start in sorted(hourly_energy.keys()):
             stat_time = dt_util.as_utc(hour_start)
@@ -518,7 +425,19 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 )
             )
 
-        # Add statistics to Home Assistant
+            # Calculate cost if price info is available
+            if price_info and cost_statistic_id:
+                cost = energy_kwh * price
+                cost_sum += cost
+                cost_statistics.append(
+                    StatisticData(
+                        start=stat_time,
+                        state=cost,
+                        sum=cost_sum,
+                    )
+                )
+
+        # Add energy statistics to Home Assistant
         if statistics:
             _LOGGER.debug(
                 "Adding %s hourly statistics for %s",
@@ -526,6 +445,26 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 statistic_id,
             )
             async_add_external_statistics(self.hass, metadata, statistics)
+
+        # Add cost statistics if available
+        if cost_statistics and price_info and cost_statistic_id and cost_name:
+            currency = price_info[1]
+            cost_metadata = StatisticMetaData(
+                mean_type=StatisticMeanType.NONE,
+                has_sum=True,
+                name=cost_name,
+                source=DOMAIN,
+                statistic_id=cost_statistic_id,
+                unit_class=None,
+                unit_of_measurement=currency,
+            )
+            _LOGGER.debug(
+                "Adding %s hourly cost statistics for %s (currency: %s)",
+                len(cost_statistics),
+                cost_statistic_id,
+                currency,
+            )
+            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
 
     async def import_statistics(self, start: date, end: date) -> None:
         """Import statistics for a custom date range."""
@@ -699,7 +638,5 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 )
         except AuthenticationError:
             raise
-        except APIError as err:
-            _LOGGER.debug("Failed to fetch production load curve for import: %s", err)
         except APIError as err:
             _LOGGER.debug("Failed to fetch production load curve for import: %s", err)

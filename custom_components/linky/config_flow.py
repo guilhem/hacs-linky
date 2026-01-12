@@ -17,6 +17,8 @@ from homeassistant.config_entries import (
 from homeassistant.const import CONF_TOKEN
 from homeassistant.core import callback
 from homeassistant.helpers.selector import (
+    EntitySelector,
+    EntitySelectorConfig,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -31,6 +33,7 @@ from pylinky import AsyncLinkyClient, InvalidTokenError, PRMAccessError
 
 from .const import (
     CONF_PRM,
+    CONF_PRICE_ENTITY,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL_HOURS,
     DOMAIN,
@@ -52,6 +55,7 @@ class LinkyOptionsFlow(OptionsFlow):
         current_interval = self.config_entry.options.get(
             CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS
         )
+        current_price_entity = self.config_entry.options.get(CONF_PRICE_ENTITY)
 
         return self.async_show_form(
             step_id="init",
@@ -68,6 +72,9 @@ class LinkyOptionsFlow(OptionsFlow):
                             mode=NumberSelectorMode.SLIDER,
                             unit_of_measurement="h",
                         )
+                    ),
+                    vol.Optional(CONF_PRICE_ENTITY, default=current_price_entity): EntitySelector(
+                        EntitySelectorConfig(domain="sensor"),
                     ),
                 }
             ),

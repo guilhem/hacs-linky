@@ -78,15 +78,20 @@ def _get_last_reading_attrs(data: LinkyData, attr: str) -> dict[str, Any]:
 
 
 SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
-    # Total consumption in kWh (entity-backed for Energy pricing)
+    # Total consumption in kWh (reads latest daily reading)
     LinkySensorEntityDescription(
         key="total_consumption_kwh",
         translation_key="total_consumption_kwh",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        value_fn=lambda data: data.consumption_kwh_sum,
-        available_fn=lambda data: data.consumption_kwh_sum is not None,
+        value_fn=lambda data: (
+            float(data.daily_consumption.interval_reading[-1].value) / 1000.0
+            if data.daily_consumption and data.daily_consumption.interval_reading
+            else None
+        ),
+        available_fn=lambda data: data.daily_consumption is not None,
+        extra_state_fn=lambda data: _get_last_reading_attrs(data, "daily_consumption"),
     ),
     LinkySensorEntityDescription(
         key="daily_consumption",
@@ -111,15 +116,19 @@ SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
             else None
         ),
     ),
-    # Total production in kWh (entity-backed)
+    # Total production in kWh (reads latest daily reading)
     LinkySensorEntityDescription(
         key="total_production_kwh",
         translation_key="total_production_kwh",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        value_fn=lambda data: data.production_kwh_sum,
-        available_fn=lambda data: data.production_kwh_sum is not None,
+        value_fn=lambda data: (
+            float(data.daily_production.interval_reading[-1].value) / 1000.0
+            if data.daily_production and data.daily_production.interval_reading
+            else None
+        ),
+        available_fn=lambda data: data.daily_production is not None,
         entity_registry_enabled_default=False,
     ),
     LinkySensorEntityDescription(
