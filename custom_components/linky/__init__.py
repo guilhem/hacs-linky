@@ -69,11 +69,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> boo
 
     entry.runtime_data = coordinator
 
-    # Ensure statistics display names are up to date (Energy Dashboard label)
-    await coordinator.async_ensure_statistics_names()
-
-    # Cleanup legacy Wh statistics to avoid UI confusion
-    await coordinator.async_cleanup_legacy_statistics()
 
     # Listen for options updates
     entry.async_on_unload(entry.add_update_listener(async_update_options))
