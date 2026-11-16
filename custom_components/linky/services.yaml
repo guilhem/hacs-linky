@@ -45,3 +45,21 @@ get_status:
       selector:
         config_entry:
           integration: linky
+import_conso_csv:
+  name: Import a Conso Downloader CSV
+  description: Fill missing hourly consumption points from a CSV without contacting Conso. Existing values are kept.
+  fields:
+    config_entry_id:
+      name: Linky meter
+      description: Select the meter whose PRM is in the filename.
+      required: true
+      selector:
+        config_entry:
+          integration: linky
+    file:
+      name: CSV file
+      description: Select the consumption CSV exported by Conso Downloader.
+      required: true
+      selector:
+        file:
+          accept: ".csv,text/csv"

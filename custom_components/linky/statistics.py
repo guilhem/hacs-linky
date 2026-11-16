@@ -8,10 +8,10 @@ from collections.abc import Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
-from math import isfinite
+from math import isclose, isfinite
 from typing import TYPE_CHECKING
 
-from homeassistant.components.recorder.db_schema import Statistics
+from homeassistant.components.recorder.db_schema import Statistics, StatisticsMeta
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
@@ -19,6 +19,7 @@ from homeassistant.components.recorder.models import (
 )
 from homeassistant.components.recorder.statistics import (
     StatisticsRow,
+    get_metadata_with_session,
     import_statistics,
     statistic_during_period,
     statistics_during_period,
@@ -26,8 +27,9 @@ from homeassistant.components.recorder.statistics import (
 from homeassistant.components.recorder.tasks import RecorderTask
 from homeassistant.const import UnitOfEnergy
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.recorder import get_instance
+from homeassistant.helpers.recorder import get_instance, session_scope
 from homeassistant.util.unit_conversion import EnergyConverter
+from sqlalchemy import select
 
 from .const import DOMAIN, PARIS_TZ
 
@@ -194,13 +196,114 @@ def _build_suffix(hass: HomeAssistant, statistic_id: str, measured: Buckets) -> 
     return result
 
 
+def _build_fill(
+    recorder: Recorder, statistic_id: str, measured: Buckets, counts: dict[str, int]
+) -> list[StatisticData]:
+    """Add missing hours and shift stored sums by only the added energy."""
+    query = (
+        select(
+            Statistics.start_ts,
+            Statistics.state,
+            Statistics.sum,
+            Statistics.mean,
+            Statistics.min,
+            Statistics.max,
+            Statistics.last_reset_ts,
+        )
+        .join(StatisticsMeta, Statistics.metadata_id == StatisticsMeta.id)
+        .where(StatisticsMeta.statistic_id == statistic_id)
+    )
+    with session_scope(session=recorder.get_session(), read_only=True) as session:
+        stored = get_metadata_with_session(recorder, session, statistic_ids={statistic_id})
+        if statistic_id in stored:
+            unit = stored[statistic_id][1]["unit_of_measurement"]
+            if unit != UnitOfEnergy.KILO_WATT_HOUR:
+                raise HomeAssistantError(
+                    f"Linky statistics use unit {unit!r}; expected kWh for CSV import"
+                )
+        since = min(measured).timestamp()
+        existing = {
+            datetime.fromtimestamp(row.start_ts, UTC): row
+            for row in session.execute(query.where(Statistics.start_ts >= since))
+        }
+        missing: Buckets = {}
+        for start, value in measured.items():
+            if (row := existing.get(start)) is None:
+                missing[start] = value
+            elif row.state is not None and isclose(row.state, value, rel_tol=0, abs_tol=1e-9):
+                counts["identical"] += 1
+            else:
+                counts["conflicts"] += 1
+        if not missing:
+            return []
+
+        first = min(missing)
+        preceding = max((start for start in existing if start < first), default=None)
+        predecessor = (
+            existing[preceding]
+            if preceding is not None
+            else session.execute(
+                query.where(Statistics.start_ts < first.timestamp())
+                .order_by(Statistics.start_ts.desc())
+                .limit(1)
+            ).first()
+        )
+
+    if predecessor is not None:
+        base = predecessor.sum
+        if base is None or not isfinite(base):
+            raise HomeAssistantError("Linky statistics have an invalid preceding cumulative sum")
+    else:
+        # Recorder measures the first change from zero, including any adjustment.
+        base = 0.0
+
+    result: list[StatisticData] = []
+    added_energy = 0.0
+    for start in sorted(missing.keys() | existing.keys()):
+        if start < first:
+            continue
+        if (row := existing.get(start)) is None:
+            state = missing[start]
+            added_energy += state
+            total = base + added_energy
+            stat = StatisticData(start=start, state=state, sum=total)
+        else:
+            if row.sum is None or not isfinite(row.sum):
+                raise HomeAssistantError("Linky statistics have an invalid stored cumulative sum")
+            base = row.sum
+            total = base + added_energy
+            if total == base:
+                continue
+            # Recorder's import replaces omitted fields on existing rows.
+            stat = StatisticData(
+                start=start,
+                state=row.state,
+                sum=total,
+                mean=row.mean,
+                min=row.min,
+                max=row.max,
+                last_reset=(
+                    datetime.fromtimestamp(row.last_reset_ts, UTC)
+                    if row.last_reset_ts is not None
+                    else None
+                ),
+            )
+        if not isfinite(total):
+            raise HomeAssistantError("Linky statistics would have a non-finite cumulative sum")
+        result.append(stat)
+
+    counts["added"] = len(missing)
+    return result
+
+
 @dataclass(slots=True)
 class _WriteStatisticsTask(RecorderTask):
     """Read, upsert and verify each series together in Recorder's queue."""
 
     prm: str
     series: Mapping[tuple[str, str], Buckets]
-    completion: Future[None]
+    completion: Future[dict[str, int]]
+    fill_only: bool
 
     def run(self, recorder: Recorder) -> None:
         """Atomically claim the task unless its caller cancelled it while queued."""
@@ -208,19 +311,24 @@ class _WriteStatisticsTask(RecorderTask):
             return
 
         try:
-            self._write(recorder)
+            counts = self._write(recorder)
         except Exception as err:
             self.completion.set_exception(err)
         else:
-            self.completion.set_result(None)
+            self.completion.set_result(counts)
 
-    def _write(self, recorder: Recorder) -> None:
+    def _write(self, recorder: Recorder) -> dict[str, int]:
         hass = recorder.hass
+        counts = {"added": 0, "identical": 0, "conflicts": 0}
         for (direction, resolution), measured in self.series.items():
             if not measured:
                 continue
             statistic_id = f"{DOMAIN}:{self.prm}_{direction}_{resolution}_energy"
-            stats = _build_suffix(hass, statistic_id, measured)
+            stats = (
+                _build_fill(recorder, statistic_id, measured, counts)
+                if self.fill_only
+                else _build_suffix(hass, statistic_id, measured)
+            )
             if not stats:
                 continue
 
@@ -246,25 +354,45 @@ class _WriteStatisticsTask(RecorderTask):
                     raise HomeAssistantError(
                         f"Recorder did not confirm Linky {resolution} {direction} statistics"
                     )
+        return counts
 
 
 async def async_write_statistics(
     hass: HomeAssistant, prm: str, series: Mapping[tuple[str, str], Buckets]
 ) -> None:
     """Upsert measured buckets and confirm all new cumulative sums in Recorder."""
+    await _async_queue_statistics(hass, prm, series, fill_only=False)
+
+
+async def async_fill_hourly_consumption(
+    hass: HomeAssistant, prm: str, measured: Buckets
+) -> dict[str, int]:
+    """Fill missing hourly consumption and classify overlaps without replacing them."""
+    return await _async_queue_statistics(
+        hass, prm, {("consumption", "hourly"): measured}, fill_only=True
+    )
+
+
+async def _async_queue_statistics(
+    hass: HomeAssistant,
+    prm: str,
+    series: Mapping[tuple[str, str], Buckets],
+    *,
+    fill_only: bool,
+) -> dict[str, int]:
     if not any(series.values()):
-        return
+        return {"added": 0, "identical": 0, "conflicts": 0}
 
     try:
         recorder = get_instance(hass)
     except KeyError as err:
         raise HomeAssistantError("Home Assistant Recorder is unavailable") from err
 
-    completion: Future[None] = Future()
-    recorder.queue_task(_WriteStatisticsTask(prm, series, completion))
+    completion: Future[dict[str, int]] = Future()
+    recorder.queue_task(_WriteStatisticsTask(prm, series, completion, fill_only))
     try:
         async with asyncio.timeout(60):
-            await asyncio.wrap_future(completion)
+            return await asyncio.wrap_future(completion)
     except TimeoutError as err:
         raise HomeAssistantError("Timed out waiting for Linky statistics in Recorder") from err
     finally:
