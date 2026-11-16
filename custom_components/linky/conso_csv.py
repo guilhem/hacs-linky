@@ -56,8 +56,9 @@ def _parse_rows(rows: Iterator[list[str]], prm: str) -> tuple[Buckets, list[str]
         starts, ends = _utc_candidates(begin), _utc_candidates(finish)
         if not starts or not ends:
             # Keep the real hours next to an impossible spring timestamp reportable.
-            invalid_hours.update(_hour(start) for start in starts)
-            invalid_hours.update(_hour(end - datetime.resolution) for end in ends)
+            for instant in starts | {end - datetime.resolution for end in ends}:
+                hour = _hour(instant)
+                first, last = min(first, hour), max(last, hour + _HOUR)
             continue
         aware = begin.tzinfo is not None and finish.tzinfo is not None
         candidates = [
@@ -81,9 +82,6 @@ def _parse_rows(rows: Iterator[list[str]], prm: str) -> tuple[Buckets, list[str]
             # A missing, conflicting or ambiguous reading cannot complete an hour.
             invalid_hours.update((_hour(start), _hour(end - datetime.resolution)))
 
-    if invalid_hours:
-        first = min(first, min(invalid_hours))
-        last = max(last, max(invalid_hours) + _HOUR)
     if first >= last:
         raise ServiceValidationError("Linky CSV contains no readings")
     if last - first > _MAX_SPAN:

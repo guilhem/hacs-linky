@@ -104,6 +104,18 @@ def test_spring_gap_is_reported_at_export_boundary(tmp_path: Path, skipped: str)
     )
 
 
+def test_spring_gap_does_not_discard_an_hour_with_explicit_coverage(tmp_path: Path) -> None:
+    path = _write_csv(
+        tmp_path,
+        '2026-03-29T01:00+01:00;2026-03-29T03:00+02:00;"1,25"',
+        '2026-03-29T02:30;2026-03-29T03:00;"null"',
+    )
+    assert read_conso_csv(path, _PRM) == (
+        {datetime(2026, 3, 29, 0, tzinfo=UTC): 1.25},
+        [],
+    )
+
+
 def test_midnight_interval_partial_edges_and_internal_gap(tmp_path: Path) -> None:
     path = _write_csv(
         tmp_path,
