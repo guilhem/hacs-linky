@@ -2,129 +2,111 @@
 
 from __future__ import annotations
 
-import logging
-from datetime import date, datetime
+import asyncio
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_TOKEN, Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryAuthFailed, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
-from pylinky import (
-    AsyncLinkyClient,
-    AuthenticationError,
-    InvalidTokenError,
-    create_ssl_context,
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.service import async_register_admin_service
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util import dt as dt_util
+
+from .api import AuthenticationError, LinkyClient, PRMAccessError
+from .const import (
+    CONF_PRM,
+    CONF_SCAN_INTERVAL,
+    DEFAULT_SCAN_INTERVAL_HOURS,
+    DOMAIN,
+    PARIS_TZ,
 )
-
-from .const import CONF_PRM, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS, DOMAIN
 from .coordinator import LinkyDataUpdateCoordinator
-
-_LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 type LinkyConfigEntry = ConfigEntry[LinkyDataUpdateCoordinator]
 
 SERVICE_IMPORT_HISTORICAL_DATA = "import_historical_data"
+ATTR_CONFIG_ENTRY_ID = "config_entry_id"
 ATTR_START_DATE = "start_date"
 ATTR_END_DATE = "end_date"
 
 SERVICE_IMPORT_HISTORICAL_DATA_SCHEMA = vol.Schema(
     {
+        vol.Required(ATTR_CONFIG_ENTRY_ID): str,
         vol.Required(ATTR_START_DATE): cv.date,
         vol.Optional(ATTR_END_DATE): cv.date,
     }
 )
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> bool:
-    """Set up Linky from a config entry."""
-    token = entry.data[CONF_TOKEN]
-    prm = entry.data[CONF_PRM]
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the Linky action once for all meters."""
 
-    # Create SSL context in executor to avoid blocking the event loop
-    ssl_context = await hass.async_add_executor_job(create_ssl_context)
-
-    try:
-        client = AsyncLinkyClient(
-            token=token,
-            prm=prm,
-            user_agent="github.com/guilhem/hacs-linky",
-            ssl_context=ssl_context,
-        )
-    except InvalidTokenError as err:
-        raise ConfigEntryAuthFailed("Invalid token") from err
-
-    # Get scan interval from options or use default
-    scan_interval_hours = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS)
-
-    coordinator = LinkyDataUpdateCoordinator(hass, client, scan_interval_hours)
-
-    try:
-        await coordinator.async_config_entry_first_refresh()
-    except AuthenticationError as err:
-        raise ConfigEntryAuthFailed("Authentication failed") from err
-
-    entry.runtime_data = coordinator
-
-
-    # Listen for options updates
-    entry.async_on_unload(entry.add_update_listener(async_update_options))
-
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Register services
     async def handle_import_historical_data(call: ServiceCall) -> None:
-        """Handle the import_historical_data service call."""
-        start_date = call.data[ATTR_START_DATE]
-        end_date = call.data.get(ATTR_END_DATE, date.today())
+        """Import statistics for the selected loaded meter."""
+        entry = hass.config_entries.async_get_entry(call.data[ATTR_CONFIG_ENTRY_ID])
+        if entry is None or entry.domain != DOMAIN or entry.state is not ConfigEntryState.LOADED:
+            raise ServiceValidationError("Select a loaded Linky meter")
 
-        # Validate dates
-        if start_date > end_date:
-            raise ServiceValidationError("start_date must be before or equal to end_date")
+        today = dt_util.now(PARIS_TZ).date()
+        start = call.data[ATTR_START_DATE]
+        end = call.data.get(ATTR_END_DATE, today)
 
-        if end_date > date.today():
-            raise ServiceValidationError("end_date cannot be in the future")
+        if start >= end:
+            raise ServiceValidationError("Start date must be before end date")
+        if end > today:
+            raise ServiceValidationError("End date cannot be after today in Paris")
 
-        _LOGGER.info(
-            "Importing historical data from %s to %s for PRM %s",
-            start_date,
-            end_date,
-            prm,
+        task = entry.async_create_background_task(
+            hass, entry.runtime_data.import_statistics(start, end), "Import Linky statistics"
         )
+        try:
+            await task
+        except ConfigEntryAuthFailed:
+            entry.async_start_reauth(hass)
+            raise
+        except asyncio.CancelledError:
+            if entry.state is not ConfigEntryState.LOADED:
+                raise ServiceValidationError("The Linky meter was unloaded during import") from None
+            raise
 
-        # Import the statistics
-        await coordinator.import_statistics(start_date, end_date)
-
-        _LOGGER.info("Historical data import completed")
-
-    # Register the service only once per domain
-    if not hass.services.has_service(DOMAIN, SERVICE_IMPORT_HISTORICAL_DATA):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_IMPORT_HISTORICAL_DATA,
-            handle_import_historical_data,
-            schema=SERVICE_IMPORT_HISTORICAL_DATA_SCHEMA,
-        )
-
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_IMPORT_HISTORICAL_DATA,
+        handle_import_historical_data,
+        schema=SERVICE_IMPORT_HISTORICAL_DATA_SCHEMA,
+    )
     return True
 
 
-async def async_update_options(hass: HomeAssistant, entry: LinkyConfigEntry) -> None:
-    """Handle options update."""
-    await hass.config_entries.async_reload(entry.entry_id)
+async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> bool:
+    """Set up Linky from a config entry."""
+    try:
+        client = LinkyClient(
+            async_get_clientsession(hass), entry.data[CONF_TOKEN], prm=entry.data[CONF_PRM]
+        )
+    except (AuthenticationError, PRMAccessError) as err:
+        raise ConfigEntryAuthFailed(
+            "Token is invalid or does not grant access to the meter"
+        ) from err
+
+    coordinator = LinkyDataUpdateCoordinator(
+        hass,
+        client,
+        scan_interval_hours=entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS),
+        config_entry=entry,
+    )
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> bool:
-    """Unload a config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        await entry.runtime_data.client.close()
-
-        # Unregister services if no more entries
-        entries = hass.config_entries.async_entries(DOMAIN)
-        if len(entries) == 1:  # This entry is the last one
-            hass.services.async_remove(DOMAIN, SERVICE_IMPORT_HISTORICAL_DATA)
-
-    return unload_ok
+    """Unload the platforms; Home Assistant owns the shared HTTP session."""
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

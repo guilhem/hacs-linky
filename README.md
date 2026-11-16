@@ -1,124 +1,85 @@
-# Linky Integration for Home Assistant
+# Linky for Home Assistant
 
-[![HACS](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
+Bring the electricity measured by your Linky meter into Home Assistant's **Energy** dashboard. See how much you drew from the grid and, if your installation exports electricity, how much you sent back.
 
-Intégration Home Assistant pour récupérer les données de consommation et production de votre compteur Linky via l'API [Conso](https://conso.boris.sh/).
+Home Assistant fetches readings through [Conso API](https://conso.boris.sh/), using
+[Enedis Mesure synchrone V2](https://conso.boris.sh/migration-2026/). Enedis publishes
+readings after the day they were measured, usually the following morning. A power
+sensor shows the latest *published* measurement; it cannot track a live load.
 
-## Fonctionnalités
-
-- **Consommation journalière** - Énergie consommée en Wh
-- **Consommation totale (7 jours)** - Total sur la semaine
-- **Puissance actuelle** - Puissance moyenne sur 30 minutes en W
-- **Puissance maximale** - Pic de puissance journalier en VA
-- **Production journalière** - Pour les installations solaires (désactivé par défaut)
-- **Puissance de production** - Puissance de production actuelle
-- **📊 Historique complet** - Stockage jour par jour des données dans les statistiques Home Assistant
-- **⚡ Energy Dashboard** - Intégration native avec le tableau de bord énergie
-
-## Prérequis
-
-1. Un compteur Linky installé
-2. Un compte Enedis avec la collecte des données horaires activée
-3. Un token d'authentification obtenu sur [conso.boris.sh](https://conso.boris.sh/)
-
-## Installation
-
-### Via HACS (recommandé)
-
-1. Ouvrez HACS dans Home Assistant
-2. Cliquez sur "Intégrations"
-3. Cliquez sur les 3 points en haut à droite → "Dépôts personnalisés"
-4. Ajoutez `https://github.com/guilhem/hacs-linky` avec la catégorie "Intégration"
-5. Recherchez "Linky" et installez l'intégration
-6. Redémarrez Home Assistant
-
-### Installation manuelle
-
-1. Copiez le dossier `custom_components/linky` dans votre dossier `config/custom_components/`
-2. Redémarrez Home Assistant
-
-## Configuration
-
-1. Allez dans **Paramètres** → **Appareils et services** → **Ajouter une intégration**
-2. Recherchez "Linky"
-3. Entrez votre token obtenu sur [conso.boris.sh](https://conso.boris.sh/)
-4. Si votre token donne accès à plusieurs compteurs, sélectionnez celui à configurer
-
-### Importer l'historique
-
-Pour importer des données historiques au-delà des 365 derniers jours automatiquement récupérés :
-
-1. Allez dans **Outils de développement** → **Services**
-2. Sélectionnez le service `linky.import_historical_data`
-3. Entrez la date de début (ex: `2023-01-01`)
-4. (Optionnel) Entrez la date de fin (par défaut: aujourd'hui)
-5. Cliquez sur **Appeler le service**
-
-Les données historiques seront importées et ajoutées aux statistiques existantes.
-
-**Exemple YAML :**
-
-```yaml
-service: linky.import_historical_data
-data:
-  start_date: "2023-01-01"
-  end_date: "2024-12-31"
+```mermaid
+flowchart LR
+    A[Linky readings from Enedis] --> B[Conso API]
+    B --> C[Linky integration]
+    C --> D[Latest readings on the device page]
+    C --> E[History in the Energy dashboard]
 ```
 
-📖 **Guide complet** : Consultez [IMPORT_HISTORY_GUIDE.md](IMPORT_HISTORY_GUIDE.md) pour des exemples détaillés, bonnes pratiques et résolution de problèmes.
+## Connect a meter
 
-## Entités créées
+You need Home Assistant **2026.11.1 or later** with Recorder enabled, a Linky
+meter, and a [Conso API token](https://conso.boris.sh/). Enable data collection
+with Enedis; hourly Energy charts also require access to the load curve.
 
-### Sensors
+1. [Open Linky in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=guilhem&repository=hacs-linky&category=integration).
+   You can also add `https://github.com/guilhem/hacs-linky` as an **Integration**
+   from HACS's **Custom repositories** menu.
+2. Download **Linky** and restart Home Assistant. For a manual installation,
+   copy `custom_components/linky` into Home Assistant's `config/custom_components`
+   directory and restart.
+3. Open **Settings → Devices & services → Add integration → Linky** and enter
+   the token. If the token covers multiple meters, select the meter you want.
+   Run the setup again for each additional meter.
+4. Open the Linky device page. **Daily consumption** displays the latest
+   published day, and its `last_date` attribute tells you when it was measured.
 
-| Entité | Description | Unité |
-| ------ | ----------- | ----- |
-| `sensor.linky_XXXXXX_daily_consumption` | Dernière consommation journalière | Wh |
-| `sensor.linky_XXXXXX_total_consumption_week` | Total sur 7 jours | Wh |
-| `sensor.linky_XXXXXX_current_power` | Puissance moyenne (30 min) | W |
-| `sensor.linky_XXXXXX_max_power` | Puissance max du jour | VA |
-| `sensor.linky_XXXXXX_daily_production` | Production journalière | Wh |
-| `sensor.linky_XXXXXX_current_production_power` | Puissance de production | W |
+Export sensors are disabled by default. If you feed electricity back into the
+grid, enable them from the meter's entity list. Export measures what crosses
+your meter towards the grid; it does not measure total solar generation.
 
-### Statistiques (Energy Dashboard)
+## Add the meter to Energy
 
-L'intégration enregistre automatiquement les données historiques jour par jour dans les statistiques Home Assistant :
+Open **Settings → Dashboards → Energy**. Under **Grid consumption**, select
+`Linky {PRM} hourly consumption (kWh)`. If you export, select
+`Linky {PRM} hourly production (kWh)` under **Return to grid**. Use the
+corresponding **daily** statistic when hourly data is unavailable. Adding both
+resolutions for the same meter and direction would count the electricity twice.
+Use the `Europe/Paris` time zone in Home Assistant to align calendar days with Linky.
 
-- `linky:{PRM}_energy_consumption` - Historique de consommation journalière
-- `linky:{PRM}_energy_production` - Historique de production journalière (si applicable)
+The device's latest daily reading is a snapshot; choose the named Linky
+statistics for Energy history. Linky publishes energy quantities only. To show
+a cost for an external statistic, Energy needs a separate cost statistic.
 
-Ces statistiques sont automatiquement disponibles dans le **Tableau de bord Énergie** de Home Assistant.
+## Import an earlier period
 
-#### Configuration du Energy Dashboard
+Go to **Developer Tools → Actions** and select **Linky: Import historical data**.
+Select the meter, enter the first day to include, then enter the first day to
+exclude. For example, **2026-10-01** to **2026-10-08** imports the first seven
+days of October. The end defaults to today in Paris. Import up to 30 days at a
+time. A partial result reports missing or failed data; you can run the same
+range again to pick up late or corrected readings without double counting.
+An incomplete hour or an ambiguous timestamp at the clock change is left as a gap.
 
-1. Allez dans **Paramètres** → **Tableaux de bord** → **Énergie**
-2. Dans **Consommation du réseau** : sélectionnez `Linky {PRM} consumption`
-3. (Optionnel) Dans **Retour au réseau** : sélectionnez `Linky {PRM} production`
+## If data is missing
 
-Pour plus de détails sur l'implémentation des statistiques, consultez [STATISTICS_IMPLEMENTATION.md](STATISTICS_IMPLEMENTATION.md).
+| What you see | What to check |
+| --- | --- |
+| Home Assistant asks you to sign in again | Generate a Conso token for the same meter and enter it in the repair prompt. |
+| Daily readings are visible but no hourly series appears | Check that Enedis load curve collection is enabled and that Conso can return interval data. You can use the daily statistic in Energy. |
+| Today's readings are absent | Check the reading date on the sensor. Conso does not publish a live feed. |
 
-## Différences avec ha-linky
+## Develop
 
-| Critère | hacs-linky | ha-linky |
-| --- | --- | --- |
-| Type | Intégration native | Add-on |
-| Installation | HACS / manuel | Supervisor |
-| Compatible HAOS | Oui | Oui |
-| Compatible Docker | Oui | Non (nécessite Supervisor) |
-| Historique | Illimité (statistiques) | 1 an |
-| Energy Dashboard | Oui (natif) | Non |
-| Calcul des coûts | Non | Oui |
+Use [uv](https://docs.astral.sh/uv/) with Python 3.14. After cloning the repository:
 
-## Dépannage
+```sh
+uv run --extra dev ruff check
+uv run --extra dev ruff format --check
+uv run --extra dev pytest
+```
 
-### Token invalide
+The tests use Home Assistant and simulated Conso responses. No meter or token is
+required. Report issues with the Home Assistant version and the affected
+feature; remove tokens and meter identifiers from logs before sharing them.
 
-Vérifiez que votre token est toujours valide sur [conso.boris.sh](https://conso.boris.sh/). Les tokens peuvent expirer.
-
-### Pas de données
-
-Les données Linky sont disponibles avec un délai de 24 à 48 heures. La puissance instantanée (load curve) peut avoir un délai supplémentaire.
-
-## Licence
-
-MIT
+[MIT license](LICENSE)

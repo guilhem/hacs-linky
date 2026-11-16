@@ -1,10 +1,10 @@
 """Config flow for Linky integration."""
 
-# pylint: disable=abstract-method
-
 from __future__ import annotations
 
 import logging
+from contextlib import suppress
+from datetime import timedelta
 from typing import Any
 
 import voluptuous as vol
@@ -12,13 +12,12 @@ from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
-    OptionsFlow,
+    OptionsFlowWithReload,
 )
 from homeassistant.const import CONF_TOKEN
 from homeassistant.core import callback
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
-    EntitySelector,
-    EntitySelectorConfig,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -29,22 +28,34 @@ from homeassistant.helpers.selector import (
     TextSelectorConfig,
     TextSelectorType,
 )
-from pylinky import AsyncLinkyClient, InvalidTokenError, PRMAccessError
+from homeassistant.util import dt as dt_util
 
+from .api import (
+    APIError,
+    AuthenticationError,
+    HistoryLimitError,
+    LinkyClient,
+    NoDataError,
+    PRMAccessError,
+    fetch_recent,
+)
 from .const import (
     CONF_PRM,
-    CONF_PRICE_ENTITY,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL_HOURS,
     DOMAIN,
     MAX_SCAN_INTERVAL_HOURS,
     MIN_SCAN_INTERVAL_HOURS,
+    PARIS_TZ,
 )
 
 _LOGGER = logging.getLogger(__name__)
+TOKEN_SCHEMA = vol.Schema(
+    {vol.Required(CONF_TOKEN): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))}
+)
 
 
-class LinkyOptionsFlow(OptionsFlow):
+class LinkyOptionsFlow(OptionsFlowWithReload):
     """Handle options flow for Linky."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
@@ -55,8 +66,6 @@ class LinkyOptionsFlow(OptionsFlow):
         current_interval = self.config_entry.options.get(
             CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS
         )
-        current_price_entity = self.config_entry.options.get(CONF_PRICE_ENTITY)
-
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
@@ -72,9 +81,6 @@ class LinkyOptionsFlow(OptionsFlow):
                             mode=NumberSelectorMode.SLIDER,
                             unit_of_measurement="h",
                         )
-                    ),
-                    vol.Optional(CONF_PRICE_ENTITY, default=current_price_entity): EntitySelector(
-                        EntitySelectorConfig(domain="sensor"),
                     ),
                 }
             ),
@@ -97,93 +103,104 @@ class LinkyConfigFlow(ConfigFlow, domain=DOMAIN):
         self._token: str | None = None
         self._prms: list[str] = []
 
-    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Handle the initial step - token input."""
-        errors: dict[str, str] = {}
+    async def _async_check_token(
+        self, token: str, prm: str | None = None
+    ) -> tuple[list[str], str | None]:
+        """Discover meters and check API access once the meter is known."""
+        try:
+            client = LinkyClient(async_get_clientsession(self.hass), token, prm=prm)
+            if prm is not None or len(client.prms) == 1:
+                end = dt_util.now(PARIS_TZ).date()
+                # Both responses confirm access; a new meter may have no completed day yet.
+                with suppress(NoDataError, HistoryLimitError):
+                    await fetch_recent(client.get_daily_consumption, end - timedelta(days=3), end)
+            return client.prms, None
+        except AuthenticationError:
+            return [], "invalid_token"
+        except PRMAccessError:
+            return [], "prm_access_denied"
+        except APIError:
+            return [], "cannot_connect"
+        except RuntimeError, ValueError:
+            _LOGGER.exception("Unexpected error during Linky token validation")
+            return [], "unknown"
 
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Handle the initial token input."""
+        errors = {}
         if user_input is not None:
             token = user_input[CONF_TOKEN]
-
-            try:
-                client = AsyncLinkyClient(token=token)
-                self._token = token
-                self._prms = client.prms
-
-                if len(self._prms) == 1:
-                    # Single PRM, skip selection
-                    return await self._create_entry(self._prms[0])
-
-                # Multiple PRMs, go to selection step
+            prms, error = await self._async_check_token(token)
+            if error is None:
+                self._token, self._prms = token, prms
+                if len(prms) == 1:
+                    return await self._create_entry(token, prms[0])
                 return await self.async_step_select_prm()
-
-            except InvalidTokenError:
-                errors["base"] = "invalid_token"
-            except (OSError, RuntimeError, ValueError) as err:
-                _LOGGER.exception("Unexpected error during token validation: %s", err)
-                errors["base"] = "unknown"
+            errors["base"] = error
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_TOKEN): TextSelector(
-                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
-                    ),
-                }
-            ),
+            data_schema=TOKEN_SCHEMA,
             errors=errors,
-            description_placeholders={
-                "conso_url": "https://conso.boris.sh",
-            },
+            description_placeholders={"conso_url": "https://conso.boris.sh"},
         )
 
     async def async_step_select_prm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle PRM selection when multiple PRMs are available."""
-        errors: dict[str, str] = {}
-
+        """Handle meter selection when multiple meters are available."""
+        assert self._token is not None
+        errors = {}
         if user_input is not None:
             prm = user_input[CONF_PRM]
-
-            try:
-                # Validate PRM access
-                if self._token is None:
-                    errors["base"] = "unknown"
-                else:
-                    AsyncLinkyClient(token=self._token, prm=prm)
-                    return await self._create_entry(prm)
-            except PRMAccessError:
-                errors["base"] = "prm_access_denied"
-            except (OSError, RuntimeError, ValueError) as err:
-                _LOGGER.exception("Unexpected error during PRM validation: %s", err)
-                errors["base"] = "unknown"
+            _, error = await self._async_check_token(self._token, prm)
+            if error is None:
+                return await self._create_entry(self._token, prm)
+            errors["base"] = error
 
         return self.async_show_form(
             step_id="select_prm",
             data_schema=vol.Schema(
                 {
                     vol.Required(CONF_PRM): SelectSelector(
-                        SelectSelectorConfig(
-                            options=self._prms,
-                            mode=SelectSelectorMode.DROPDOWN,
-                        )
+                        SelectSelectorConfig(options=self._prms, mode=SelectSelectorMode.DROPDOWN)
                     ),
                 }
             ),
             errors=errors,
         )
 
-    async def _create_entry(self, prm: str) -> ConfigFlowResult:
-        """Create a config entry for the given PRM."""
-        # Check if this PRM is already configured
+    async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:
+        """Start reauthentication for the existing meter."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Validate the replacement token against the existing meter and reload."""
+        entry = self._get_reauth_entry()
+        errors = {}
+        if user_input is not None:
+            token = user_input[CONF_TOKEN]
+            _, error = await self._async_check_token(token, entry.data[CONF_PRM])
+            if error is None:
+                return self.async_update_reload_and_abort(entry, data_updates={CONF_TOKEN: token})
+            errors["base"] = error
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=TOKEN_SCHEMA,
+            errors=errors,
+            description_placeholders={
+                "conso_url": "https://conso.boris.sh",
+                "prm": entry.data[CONF_PRM],
+            },
+        )
+
+    async def _create_entry(self, token: str, prm: str) -> ConfigFlowResult:
+        """Create a config entry for the selected meter."""
         await self.async_set_unique_id(prm)
         self._abort_if_unique_id_configured()
-
         return self.async_create_entry(
-            title=f"Linky {prm}",
-            data={
-                CONF_TOKEN: self._token,
-                CONF_PRM: prm,
-            },
+            title=f"Linky {prm}", data={CONF_TOKEN: token, CONF_PRM: prm}
         )

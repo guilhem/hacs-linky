@@ -1,138 +1,90 @@
-"""Tests for Linky sensors."""
+"""Check the meter's latest published measurements."""
 
-from unittest.mock import AsyncMock, patch
+from dataclasses import replace
+from unittest.mock import MagicMock
 
-import pytest
 from homeassistant.const import STATE_UNAVAILABLE, UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
-from pylinky import MeteringData
 
 from custom_components.linky.const import DOMAIN
 
 
-async def test_sensors_created(
-    hass: HomeAssistant,
-    mock_linky_client: AsyncMock,
-    mock_config_entry,
+def _entity_id(hass: HomeAssistant, reading: str) -> str:
+    entity_id = er.async_get(hass).async_get_entity_id(
+        "sensor", DOMAIN, f"12345678901234_{reading}"
+    )
+    assert entity_id is not None
+    return entity_id
+
+
+async def test_latest_daily_reading_is_not_a_cumulative_meter(
+    hass: HomeAssistant, mock_linky_client: MagicMock, mock_config_entry, daily_consumption_data
 ) -> None:
-    """Test that sensors are created."""
-    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    """Use measurement dates rather than response order."""
+    mock_linky_client.get_daily_consumption.return_value = replace(
+        daily_consumption_data,
+        interval_reading=list(reversed(daily_consumption_data.interval_reading)),
+    )
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
 
-    entity_registry = er.async_get(hass)
-
-    # Check consumption sensors are created
-    assert entity_registry.async_get("sensor.linky_12345678901234_daily_consumption")
-    assert entity_registry.async_get("sensor.linky_12345678901234_current_power")
-    assert entity_registry.async_get("sensor.linky_12345678901234_maximum_power")
-
-    # Production sensors should be created but disabled by default
-    entry = entity_registry.async_get("sensor.linky_12345678901234_daily_production")
-    assert entry is not None
-    assert entry.disabled_by is not None
-
-
-async def test_daily_consumption_sensor(
-    hass: HomeAssistant,
-    mock_linky_client: AsyncMock,
-    mock_config_entry,
-    daily_consumption_data: MeteringData,
-) -> None:
-    """Test daily consumption sensor values."""
-    await hass.config_entries.async_setup(mock_config_entry.entry_id)
-    await hass.async_block_till_done()
-
-    state = hass.states.get("sensor.linky_12345678901234_daily_consumption")
+    entity_id = _entity_id(hass, "daily_consumption")
+    state = hass.states.get(entity_id)
     assert state is not None
-    # Last reading value
     assert state.state == "12100"
     assert state.attributes["unit_of_measurement"] == UnitOfEnergy.WATT_HOUR
+    assert state.attributes["last_date"] == "2024-01-07"
     assert state.attributes["device_class"] == "energy"
-    assert state.attributes["state_class"] == "total"
-    assert state.attributes["usage_point_id"] == "12345678901234"
-    assert state.attributes["quality"] == "BRUT"
+    assert "state_class" not in state.attributes
+    assert (
+        er.async_get(hass).async_get_entity_id(
+            "sensor", DOMAIN, "12345678901234_total_consumption_kwh"
+        )
+        is None
+    )
 
-
-async def test_current_power_sensor(
-    hass: HomeAssistant,
-    mock_linky_client: AsyncMock,
-    mock_config_entry,
-) -> None:
-    """Test current power sensor."""
-    await hass.config_entries.async_setup(mock_config_entry.entry_id)
-    await hass.async_block_till_done()
-
-    state = hass.states.get("sensor.linky_12345678901234_current_power")
-    assert state is not None
-    # Last load curve value
-    assert state.state == "520"
-    assert state.attributes["unit_of_measurement"] == UnitOfPower.WATT
-    assert state.attributes["device_class"] == "power"
-
-
-async def test_max_power_sensor(
-    hass: HomeAssistant,
-    mock_linky_client: AsyncMock,
-    mock_config_entry,
-) -> None:
-    """Test max power sensor."""
-    await hass.config_entries.async_setup(mock_config_entry.entry_id)
-    await hass.async_block_till_done()
-
-    state = hass.states.get("sensor.linky_12345678901234_maximum_power")
-    assert state is not None
-    # Last max power value
-    assert state.state == "5800"
-    assert state.attributes["unit_of_measurement"] == "VA"
-    assert state.attributes["device_class"] == "apparent_power"
-
-
-async def test_sensor_unavailable_when_no_data(
-    hass: HomeAssistant,
-    single_prm_token: str,
-    mock_config_entry,
-) -> None:
-    """Test sensors are unavailable when data is missing."""
-    with patch("custom_components.linky.AsyncLinkyClient") as mock_client_class:
-        mock_instance = AsyncMock()
-        mock_instance.prm = "12345678901234"
-        mock_instance.prms = ["12345678901234"]
-        mock_instance.get_daily_consumption = AsyncMock(return_value=None)
-        mock_instance.get_consumption_load_curve = AsyncMock(return_value=None)
-        mock_instance.get_max_power = AsyncMock(return_value=None)
-        mock_instance.get_daily_production = AsyncMock(return_value=None)
-        mock_instance.get_production_load_curve = AsyncMock(return_value=None)
-        mock_instance.close = AsyncMock()
-        mock_client_class.return_value = mock_instance
-
-        # This will fail because no consumption data at all
-        result = await hass.config_entries.async_setup(mock_config_entry.entry_id)
-        # Setup should fail because coordinator fails
-        assert result is False
-
-
-async def test_device_info(
-    hass: HomeAssistant,
-    mock_linky_client: AsyncMock,
-    mock_config_entry,
-) -> None:
-    """Test device info is properly set."""
-    await hass.config_entries.async_setup(mock_config_entry.entry_id)
-    await hass.async_block_till_done()
-
-    entity_registry = er.async_get(hass)
-    entry = entity_registry.async_get("sensor.linky_12345678901234_daily_consumption")
-
-    assert entry is not None
-    assert entry.device_id is not None
-
-    from homeassistant.helpers import device_registry as dr
-
-    device_registry = dr.async_get(hass)
-    device = device_registry.async_get(entry.device_id)
-
+    entity = er.async_get(hass).async_get(entity_id)
+    assert entity is not None and entity.device_id is not None
+    device = dr.async_get(hass).async_get(entity.device_id)
     assert device is not None
-    assert device.manufacturer == "Enedis"
-    assert device.model == "Linky"
     assert (DOMAIN, "12345678901234") in device.identifiers
+
+
+async def test_power_sensors_show_measurement_time(
+    hass: HomeAssistant, mock_linky_client: MagicMock, mock_config_entry
+) -> None:
+    """Report active power in W and apparent peak power in VA."""
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    power = hass.states.get(_entity_id(hass, "current_power"))
+    assert power is not None
+    assert power.state == "520"
+    assert power.attributes["unit_of_measurement"] == UnitOfPower.WATT
+    assert power.attributes["last_date"] == "2024-01-07T01:00:00+01:00"
+
+    peak = hass.states.get(_entity_id(hass, "max_power"))
+    assert peak is not None
+    assert peak.state == "5800"
+    assert peak.attributes["unit_of_measurement"] == "VA"
+    assert peak.attributes["device_class"] == "apparent_power"
+
+
+async def test_empty_endpoint_is_unavailable(
+    hass: HomeAssistant, mock_linky_client: MagicMock, mock_config_entry, load_curve_data
+) -> None:
+    """An empty curve does not affect daily readings or appear as zero power."""
+    mock_linky_client.get_consumption_load_curve.return_value = replace(
+        load_curve_data, interval_reading=[]
+    )
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    power = hass.states.get(_entity_id(hass, "current_power"))
+    assert power is not None and power.state == STATE_UNAVAILABLE
+    daily = hass.states.get(_entity_id(hass, "daily_consumption"))
+    assert daily is not None and daily.state == "12100"
+    export = er.async_get(hass).async_get(_entity_id(hass, "daily_production"))
+    assert export is not None and export.disabled

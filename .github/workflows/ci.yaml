@@ -1,0 +1,43 @@
+name: Integration checks
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: python -m pip install uv
+      - run: uv run --extra dev ruff check
+      - run: uv run --extra dev ruff format --check
+      - run: uv run --extra dev pytest
+
+  hassfest:
+    name: Home Assistant manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    name: HACS repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # HACS reads GitHub's default-branch license metadata, so check the PR file here.
+      - run: test -s LICENSE
+      - uses: hacs/action@main
+        with:
+          category: integration
+          # This custom repository is not listed in HACS defaults.
+          ignore: ${{ github.event_name == 'pull_request' && 'brands description topics license' || 'brands description topics' }}

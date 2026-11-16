@@ -14,15 +14,24 @@
         "data": {
           "prm": "Compteur (PRM)"
         }
+      },
+      "reauth_confirm": {
+        "title": "Reconnecter Linky",
+        "description": "Saisissez un nouveau jeton obtenu sur [{conso_url}]({conso_url}) pour le compteur {prm}.",
+        "data": {
+          "token": "Jeton"
+        }
       }
     },
     "error": {
       "invalid_token": "Le token est invalide ou expiré",
       "prm_access_denied": "Ce token ne permet pas d'accéder à ce compteur",
-      "unknown": "Erreur inattendue"
+      "unknown": "Erreur inattendue",
+      "cannot_connect": "Impossible de joindre Conso API. Réessayez plus tard."
     },
     "abort": {
-      "already_configured": "Ce compteur est déjà configuré"
+      "already_configured": "Ce compteur est déjà configuré",
+      "reauth_successful": "Le jeton du compteur a été mis à jour."
     }
   },
   "entity": {
@@ -31,16 +40,49 @@
         "name": "Consommation journalière"
       },
       "current_power": {
-        "name": "Puissance actuelle"
+        "name": "Dernière puissance moyenne consommée"
       },
       "max_power": {
-        "name": "Puissance maximale"
+        "name": "Puissance apparente maximale du jour"
       },
       "daily_production": {
-        "name": "Production journalière"
+        "name": "Injection journalière"
       },
       "current_production_power": {
-        "name": "Puissance de production"
+        "name": "Dernière puissance moyenne injectée"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options Linky",
+        "data": {
+          "scan_interval": "Intervalle de mise à jour"
+        },
+        "data_description": {
+          "scan_interval": "Fréquence de récupération des données, en heures. Les données Linky arrivent avec un délai de 24 à 48 heures."
+        }
+      }
+    }
+  },
+  "services": {
+    "import_historical_data": {
+      "name": "Importer l’historique",
+      "description": "Importe l’historique de consommation et d’injection du compteur Linky sélectionné.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Compteur Linky",
+          "description": "Sélectionnez le compteur Linky dont vous souhaitez importer l’historique."
+        },
+        "start_date": {
+          "name": "Date de début",
+          "description": "Premier jour à importer (inclus)."
+        },
+        "end_date": {
+          "name": "Date de fin",
+          "description": "Arrête l’import avant ce jour (exclu). Par défaut : aujourd’hui à Paris."
+        }
       }
     }
   }

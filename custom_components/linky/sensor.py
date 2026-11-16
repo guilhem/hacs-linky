@@ -1,202 +1,85 @@
-"""Sensor platform for Linky integration."""
-
-# pylint: disable=unexpected-keyword-arg,unused-argument
-# type: ignore[reportIncompatibleVariableOverride]
+"""Expose the latest published Linky readings."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time
 from typing import Any
 
-from homeassistant.components.sensor import (
-    SensorDeviceClass,
-    SensorEntity,
-    SensorEntityDescription,
-    SensorStateClass,
-)
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorEntityDescription
 from homeassistant.const import UnitOfApparentPower, UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.util import dt as dt_util
 
 from . import LinkyConfigEntry
+from .api import IntervalReading, MeteringData
 from .const import (
-    ATTR_DATA_AGE_HOURS,
     ATTR_LAST_DATE,
     ATTR_LAST_VALUE,
     ATTR_QUALITY,
     ATTR_USAGE_POINT_ID,
     DOMAIN,
+    PARIS_TZ,
 )
-from .coordinator import LinkyData, LinkyDataUpdateCoordinator
+from .coordinator import LinkyDataUpdateCoordinator
 
 
 @dataclass(frozen=True, kw_only=True)
-class LinkySensorEntityDescription(SensorEntityDescription):
-    """Describes a Linky sensor entity."""
+class LinkySensorDescription(SensorEntityDescription):
+    """Describe a published meter reading."""
 
-    value_fn: Callable[[LinkyData], int | float | None]
-    available_fn: Callable[[LinkyData], bool]
-    extra_state_fn: Callable[[LinkyData], dict[str, Any]] | None = None
-    last_reset_fn: Callable[[LinkyData], datetime | None] | None = None
+    data_key: str
 
 
-def _get_last_reading_attrs(data: LinkyData, attr: str) -> dict[str, Any]:
-    """Get extra state attributes for the last reading."""
-    metering_data = getattr(data, attr)
-    if metering_data is None or not metering_data.interval_reading:
-        return {}
-    last = metering_data.interval_reading[-1]
-
-    # Calculate data age in hours
-    last_date = last.date
-    if isinstance(last_date, datetime):
-        # If datetime, use it directly (ensure timezone aware)
-        if last_date.tzinfo is None:
-            last_date = last_date.replace(tzinfo=timezone.utc)  # noqa: UP017
-        data_age_hours = (dt_util.utcnow() - last_date).total_seconds() / 3600
-    else:
-        # If date only, assume end of day in UTC
-        last_datetime = datetime.combine(
-            last_date,
-            datetime.max.time(),
-            tzinfo=timezone.utc,  # noqa: UP017
-        )
-        data_age_hours = (dt_util.utcnow() - last_datetime).total_seconds() / 3600
-
-    return {
-        ATTR_USAGE_POINT_ID: metering_data.usage_point_id,
-        ATTR_QUALITY: metering_data.quality,
-        ATTR_LAST_VALUE: last.value,
-        ATTR_LAST_DATE: last.date.isoformat(),
-        ATTR_DATA_AGE_HOURS: round(data_age_hours, 1),
-    }
-
-
-SENSOR_DESCRIPTIONS: tuple[LinkySensorEntityDescription, ...] = (
-    # Total consumption in kWh (reads latest daily reading)
-    LinkySensorEntityDescription(
-        key="total_consumption_kwh",
-        translation_key="total_consumption_kwh",
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
-        value_fn=lambda data: (
-            float(data.daily_consumption.interval_reading[-1].value) / 1000.0
-            if data.daily_consumption and data.daily_consumption.interval_reading
-            else None
-        ),
-        available_fn=lambda data: data.daily_consumption is not None,
-        extra_state_fn=lambda data: _get_last_reading_attrs(data, "daily_consumption"),
-    ),
-    LinkySensorEntityDescription(
+SENSORS = (
+    LinkySensorDescription(
         key="daily_consumption",
         translation_key="daily_consumption",
+        data_key="daily_consumption",
         native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL,
-        value_fn=lambda data: (
-            data.daily_consumption.interval_reading[-1].value
-            if data.daily_consumption and data.daily_consumption.interval_reading
-            else None
-        ),
-        available_fn=lambda data: data.daily_consumption is not None,
-        extra_state_fn=lambda data: _get_last_reading_attrs(data, "daily_consumption"),
-        last_reset_fn=lambda data: (
-            datetime.combine(
-                data.daily_consumption.interval_reading[-1].date,
-                datetime.min.time(),
-                tzinfo=timezone.utc,  # noqa: UP017
-            )
-            if data.daily_consumption and data.daily_consumption.interval_reading
-            else None
-        ),
     ),
-    # Total production in kWh (reads latest daily reading)
-    LinkySensorEntityDescription(
-        key="total_production_kwh",
-        translation_key="total_production_kwh",
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
-        value_fn=lambda data: (
-            float(data.daily_production.interval_reading[-1].value) / 1000.0
-            if data.daily_production and data.daily_production.interval_reading
-            else None
-        ),
-        available_fn=lambda data: data.daily_production is not None,
-        entity_registry_enabled_default=False,
-    ),
-    LinkySensorEntityDescription(
+    LinkySensorDescription(
         key="current_power",
         translation_key="current_power",
+        data_key="load_curve",
         native_unit_of_measurement=UnitOfPower.WATT,
         device_class=SensorDeviceClass.POWER,
-        state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: (
-            data.load_curve.interval_reading[-1].value
-            if data.load_curve and data.load_curve.interval_reading
-            else None
-        ),
-        available_fn=lambda data: data.load_curve is not None,
     ),
-    LinkySensorEntityDescription(
+    LinkySensorDescription(
         key="max_power",
         translation_key="max_power",
+        data_key="max_power",
         native_unit_of_measurement=UnitOfApparentPower.VOLT_AMPERE,
         device_class=SensorDeviceClass.APPARENT_POWER,
-        state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: (
-            data.max_power.interval_reading[-1].value
-            if data.max_power and data.max_power.interval_reading
-            else None
-        ),
-        available_fn=lambda data: data.max_power is not None,
-        extra_state_fn=lambda data: _get_last_reading_attrs(data, "max_power"),
     ),
-    LinkySensorEntityDescription(
+    LinkySensorDescription(
         key="daily_production",
         translation_key="daily_production",
+        data_key="daily_production",
         native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL,
-        value_fn=lambda data: (
-            data.daily_production.interval_reading[-1].value
-            if data.daily_production and data.daily_production.interval_reading
-            else None
-        ),
-        available_fn=lambda data: data.daily_production is not None,
-        extra_state_fn=lambda data: _get_last_reading_attrs(data, "daily_production"),
-        last_reset_fn=lambda data: (
-            datetime.combine(
-                data.daily_production.interval_reading[-1].date,
-                datetime.min.time(),
-                tzinfo=timezone.utc,  # noqa: UP017
-            )
-            if data.daily_production and data.daily_production.interval_reading
-            else None
-        ),
         entity_registry_enabled_default=False,
     ),
-    LinkySensorEntityDescription(
+    LinkySensorDescription(
         key="current_production_power",
         translation_key="current_production_power",
+        data_key="production_load_curve",
         native_unit_of_measurement=UnitOfPower.WATT,
         device_class=SensorDeviceClass.POWER,
-        state_class=SensorStateClass.MEASUREMENT,
-        value_fn=lambda data: (
-            data.production_load_curve.interval_reading[-1].value
-            if data.production_load_curve and data.production_load_curve.interval_reading
-            else None
-        ),
-        available_fn=lambda data: data.production_load_curve is not None,
         entity_registry_enabled_default=False,
     ),
 )
+
+
+def _reading_time(reading: IntervalReading) -> datetime:
+    """Interpret timestamps without an offset as French local time."""
+    value = reading.date
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=PARIS_TZ)
+    return datetime.combine(value, time.min, PARIS_TZ)
 
 
 async def async_setup_entry(
@@ -204,69 +87,63 @@ async def async_setup_entry(
     entry: LinkyConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Linky sensors based on a config entry."""
-    coordinator = entry.runtime_data
-
-    async_add_entities(
-        LinkySensor(coordinator, description, entry) for description in SENSOR_DESCRIPTIONS
-    )
+    """Set up the meter's sensors."""
+    async_add_entities(LinkySensor(entry, description) for description in SENSORS)
 
 
 class LinkySensor(CoordinatorEntity[LinkyDataUpdateCoordinator], SensorEntity):
-    """Representation of a Linky sensor."""
+    """A snapshot of a single measurement series."""
 
-    entity_description: LinkySensorEntityDescription  # type: ignore[assignment]
+    entity_description: LinkySensorDescription
     _attr_has_entity_name = True
 
-    def __init__(
-        self,
-        coordinator: LinkyDataUpdateCoordinator,
-        description: LinkySensorEntityDescription,
-        entry: LinkyConfigEntry,
-    ) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator)
-        self.entity_description = description  # type: ignore[assignment]
-        self._attr_unique_id = f"{entry.unique_id}_{description.key}"
-        unique_id = entry.unique_id or ""
+    def __init__(self, entry: LinkyConfigEntry, description: LinkySensorDescription) -> None:
+        """Set up the sensor and associate it with the meter."""
+        super().__init__(entry.runtime_data)
+        self.entity_description = description
+        prm = self.coordinator.client.prm
+        self._attr_unique_id = f"{prm}_{description.key}"
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, unique_id)},
-            name=f"Linky {unique_id}",
+            identifiers={(DOMAIN, prm)},
+            name=f"Linky {prm}",
             manufacturer="Enedis",
             model="Linky",
             entry_type=DeviceEntryType.SERVICE,
         )
 
-    @property
-    def available(self) -> bool:  # type: ignore[override]
-        """Return if entity is available."""
-        if not super().available:
-            return False
-        if self.coordinator.data is None:
-            return False
-        return self.entity_description.available_fn(self.coordinator.data)
+    def _meter_data(self) -> MeteringData | None:
+        return getattr(self.coordinator.data, self.entity_description.data_key, None)
+
+    def _latest_reading(self, data: MeteringData) -> IntervalReading | None:
+        return max(
+            data.interval_reading,
+            key=lambda reading: _reading_time(reading).timestamp(),
+            default=None,
+        )
 
     @property
-    def native_value(self) -> int | float | None:  # type: ignore[override]
-        """Return the state of the sensor."""
-        if self.coordinator.data is None:
-            return None
-        return self.entity_description.value_fn(self.coordinator.data)
+    def available(self) -> bool:
+        """Report availability only when the endpoint has a reading."""
+        return super().available and bool((data := self._meter_data()) and data.interval_reading)
 
     @property
-    def extra_state_attributes(self) -> dict[str, Any] | None:  # type: ignore[override]
-        """Return extra state attributes."""
-        if self.coordinator.data is None:
-            return None
-        if self.entity_description.extra_state_fn is None:
-            return None
-        return self.entity_description.extra_state_fn(self.coordinator.data)
+    def native_value(self) -> int | float | None:
+        """Return the latest reading rather than depending on API order."""
+        if (data := self._meter_data()) and (reading := self._latest_reading(data)):
+            return reading.value
+        return None
 
     @property
-    def last_reset(self) -> datetime | None:  # type: ignore[override]
-        """Return the time when the sensor was last reset."""
-        if self.coordinator.data is None:
-            return None
-        if self.entity_description.last_reset_fn is None:
-            return None
-        return self.entity_description.last_reset_fn(self.coordinator.data)
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Show when Conso measured this value."""
+        if (data := self._meter_data()) and (reading := self._latest_reading(data)):
+            reading_date = reading.date
+            if isinstance(reading_date, datetime):
+                reading_date = _reading_time(reading).astimezone(PARIS_TZ)
+            return {
+                ATTR_LAST_DATE: reading_date.isoformat(),
+                ATTR_LAST_VALUE: reading.value,
+                ATTR_QUALITY: data.quality,
+                ATTR_USAGE_POINT_ID: data.usage_point_id,
+            }
+        return None

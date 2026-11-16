@@ -14,15 +14,24 @@
         "data": {
           "prm": "Meter (PRM)"
         }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Linky",
+        "description": "Enter a new token from [{conso_url}]({conso_url}) for meter {prm}.",
+        "data": {
+          "token": "Token"
+        }
       }
     },
     "error": {
       "invalid_token": "The token is invalid or expired",
       "prm_access_denied": "This token does not grant access to this meter",
-      "unknown": "Unexpected error"
+      "unknown": "Unexpected error",
+      "cannot_connect": "Could not contact Conso API. Try again later."
     },
     "abort": {
-      "already_configured": "This meter is already configured"
+      "already_configured": "This meter is already configured",
+      "reauth_successful": "The token for this meter was updated."
     }
   },
   "options": {
@@ -41,15 +50,19 @@
   "services": {
     "import_historical_data": {
       "name": "Import historical data",
-      "description": "Import historical consumption and production data from a specific date",
+      "description": "Import historical consumption and export data for the selected Linky meter.",
       "fields": {
+        "config_entry_id": {
+          "name": "Linky meter",
+          "description": "Select the Linky meter whose historical data to import."
+        },
         "start_date": {
           "name": "Start date",
-          "description": "Start date for data import (YYYY-MM-DD)"
+          "description": "First day to import (inclusive)."
         },
         "end_date": {
           "name": "End date",
-          "description": "End date for import (YYYY-MM-DD). Default: today"
+          "description": "Stop before this day (exclusive). Defaults to today in Europe/Paris."
         }
       }
     }
@@ -60,16 +73,16 @@
         "name": "Daily consumption"
       },
       "current_power": {
-        "name": "Current power"
+        "name": "Latest average consumption power"
       },
       "max_power": {
-        "name": "Maximum power"
+        "name": "Daily maximum apparent power"
       },
       "daily_production": {
-        "name": "Daily production"
+        "name": "Daily export"
       },
       "current_production_power": {
-        "name": "Production power"
+        "name": "Latest average export power"
       }
     }
   }
