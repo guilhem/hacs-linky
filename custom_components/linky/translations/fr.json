@@ -94,6 +94,26 @@
           "description": "Arrête l’import avant ce jour (exclu). Par défaut : aujourd’hui à Paris."
         }
       }
+    },
+    "refresh": {
+      "name": "Relever maintenant",
+      "description": "Lance la relève du jour si elle n’a pas encore été tentée et si le quota le permet.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Compteur Linky",
+          "description": "Choisissez le compteur à relever."
+        }
+      }
+    },
+    "get_status": {
+      "name": "Consulter l’état de la relève",
+      "description": "Affiche le quota restant et indique si le compteur peut être relevé. Aucun appel à Conso.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Compteur Linky",
+          "description": "Choisissez le compteur à consulter."
+        }
+      }
     }
   },
   "issues": {

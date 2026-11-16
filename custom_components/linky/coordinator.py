@@ -6,7 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from weakref import WeakKeyDictionary
 
 from homeassistant.core import CoreState, callback
@@ -21,7 +21,12 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .api import APIError, AuthenticationError, IntervalReading, MeteringData, NoDataError
-from .budget import ConsoBudgetError, ConsoBudgetExceeded, async_get_conso_budget
+from .budget import (
+    DAILY_ATTEMPT_USED,
+    ConsoBudgetError,
+    ConsoBudgetExceeded,
+    async_get_conso_budget,
+)
 from .const import DEFAULT_COLLECT_EXPORT, DOMAIN, PARIS_TZ
 from .statistics import (
     Buckets,
@@ -77,10 +82,12 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData | None]):
         )
         self.client = client
         self._collect_export = collect_export
+        self._batch_size = 2 if collect_export else 1
         self._daily_only = daily_only
         self._meter_lock = asyncio.Lock()
         self._cancel_deferred: Callable[[], None] | None = None
         self._skipped_update: tuple[bool, BaseException | None] | None = None
+        self._manual_results: dict[asyncio.Task, dict[str, Any] | HomeAssistantError | None] = {}
         self._conso_forbidden_pending: WeakKeyDictionary[ConfigEntry, bool] = hass.data.setdefault(
             _CONSO_FORBIDDEN_PENDING, WeakKeyDictionary()
         )
@@ -252,44 +259,104 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData | None]):
 
         return data, series, errors
 
+    async def async_refresh_now(self) -> dict[str, Any]:
+        """Run the daily refresh and report the outcome of this invocation."""
+        task = asyncio.current_task()
+        assert task is not None
+        self._manual_results[task] = {
+            "status": "skipped",
+            "reason": "The Linky coordinator is shutting down",
+        }
+        try:
+            await self.async_refresh()
+        finally:
+            result = self._manual_results.pop(task)
+
+        if isinstance(result, HomeAssistantError):
+            raise result
+        if result is not None:
+            return result
+        if isinstance(self.last_exception, ConfigEntryAuthFailed):
+            raise HomeAssistantError("Linky authentication failed. Reauthenticate the meter.")
+        if isinstance(self.last_exception, UpdateFailed):
+            raise HomeAssistantError(
+                f"{self.last_exception}. Check the Linky logs before the next daily refresh."
+            )
+        raise HomeAssistantError("The Linky refresh failed. Check the Home Assistant logs.")
+
+    async def async_get_status(self) -> dict[str, Any]:
+        """Read the local quota for a full daily refresh of this meter."""
+        return await async_get_conso_budget(self.hass).async_get_status(
+            self.client.prm, required=self._batch_size
+        )
+
+    def _set_manual_result(self, result: dict[str, Any] | HomeAssistantError | None) -> None:
+        # A refresh only reports to the action that is awaiting it in the same task.
+        if (task := asyncio.current_task()) in self._manual_results:
+            self._manual_results[task] = result
+
     async def _async_update_data(self) -> LinkyData | None:
         """Refetch the previous seven Paris days to include late revisions."""
         async with self._meter_lock:
             end = dt_util.now(PARIS_TZ).date()
             self._skipped_update = None
+            self._set_manual_result(None)
             if self.hass.state is not CoreState.running:
-                return self._skip_update()
+                return self._skip_update("Home Assistant is not running")
             budget = async_get_conso_budget(self.hass)
             try:
                 async with budget.daily_batch(
-                    self.client.prm, end, required=2 if self._collect_export else 1
+                    self.client.prm, end, required=self._batch_size
                 ) as claimed:
-                    if not claimed or dt_util.now(PARIS_TZ).date() != end:
-                        return self._skip_update()
+                    if not claimed:
+                        return self._skip_update(DAILY_ATTEMPT_USED)
+                    if dt_util.now(PARIS_TZ).date() != end:
+                        return self._skip_update(
+                            "The Paris date changed while the refresh was queued"
+                        )
                     self._async_cancel_deferred()
                     data, series, errors = await self._async_fetch_window(end - _MAX_WINDOW, end)
             except ConsoBudgetExceeded as err:
                 self._defer_daily_slot(end, err.retry_in)
                 _LOGGER.debug("Deferring the Linky refresh: %s", err)
-                return self._skip_update()
+                return self._skip_update(str(err), err.retry_in)
             except ConsoBudgetError as err:
                 raise UpdateFailed(str(err)) from err
 
+            has_data = any(series.values())
             if errors:
-                if not any(vars(data).values()):
+                if not has_data:
                     raise UpdateFailed(f"Could not refresh Linky: {'; '.join(errors)}")
                 _LOGGER.warning(
                     "Some Linky measurements could not be refreshed: %s", "; ".join(errors)
                 )
 
-            if any(series.values()):
+            if has_data:
                 try:
                     await async_write_statistics(self.hass, self.client.prm, series)
-                except HomeAssistantError as err:
+                except Exception as err:
+                    self._set_manual_result(
+                        HomeAssistantError(
+                            "Could not confirm Linky Energy statistics in Recorder. "
+                            "Check the Recorder logs before the next daily refresh."
+                        )
+                    )
+                    if not isinstance(err, HomeAssistantError):
+                        raise
                     _LOGGER.warning("Could not update Linky Energy statistics: %s", err)
+                    return data
+
+            if errors:
+                self._set_manual_result({"status": "partial", "reason": "; ".join(errors)})
+            else:
+                self._set_manual_result({"status": "updated" if has_data else "no_data"})
             return data
 
-    def _skip_update(self) -> LinkyData | None:
+    def _skip_update(self, reason: str, retry_in: float | None = None) -> LinkyData | None:
+        result: dict[str, Any] = {"status": "skipped", "reason": reason}
+        if retry_in is not None:
+            result["retry_in_seconds"] = retry_in
+        self._set_manual_result(result)
         if not self.last_update_success:
             # Keep the original failure and avoid HA logging a recovery on a skip.
             self._skipped_update = self.last_update_success, self.last_exception

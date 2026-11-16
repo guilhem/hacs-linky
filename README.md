@@ -81,17 +81,25 @@ The device's latest daily reading is a snapshot; choose the named Linky
 statistics for Energy history. Linky publishes energy quantities only. To show
 a cost for an external statistic, Energy needs a separate cost statistic.
 
-## Import an earlier period
+## Run a Linky action
 
-Go to **Developer Tools → Actions** and select **Linky: Import historical data**.
-Select the meter, enter the first day to include, then enter the first day to
+As an administrator, open **Developer Tools → Actions**, search for **Linky**,
+and select a meter.
+
+| Action | When to use it |
+| --- | --- |
+| **Refresh now** | Run the daily refresh before its scheduled time. The result indicates whether it ran or why it was skipped. A manual attempt uses the same daily slot and request budget as the scheduled refresh. |
+| **Get collection status** | See how many requests are left in the rolling 24-hour budget and why the meter might have to wait. This does not contact Conso. |
+| **Import historical data** | Add up to seven days to Energy. This uses the same request budget. |
+
+For a historical import, enter the first day to include, then the first day to
 exclude. For example, **2026-10-01** to **2026-10-08** imports the first seven
 days of October. The end defaults to today in Paris. Import at most seven days
 at a time, within the same request budget as the scheduled refresh. A partial
 result reports missing or failed data. You can import the same dates again
-without double counting once the oldest attempts are more than 24 hours old. Missing hours are left as
-gaps, and a day is not added to the daily statistics until its load curve is
-complete. For a large history, use the provider's
+without double counting once the oldest attempts are more than 24 hours old.
+Missing hours are left as gaps, and a day is not added to the daily statistics
+until its load curve is complete. For a large history, use the provider's
 [Conso Downloader](https://github.com/bokub/conso-downloader).
 
 ## If data is missing

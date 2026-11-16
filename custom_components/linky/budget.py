@@ -5,20 +5,21 @@ from __future__ import annotations
 from asyncio import Lock, Task, create_task, current_task, get_running_loop, shield, sleep
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, nullcontext
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from json import loads
 from math import isfinite
 from pathlib import Path
 from time import monotonic
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 from uuid import UUID, uuid4
 
 from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 from homeassistant.util.hass_dict import HassKey
 
-from .const import DOMAIN
+from .const import DOMAIN, PARIS_TZ
 
 _KEY = f"{DOMAIN}.conso_budget"
 _VERSION = 1
@@ -30,6 +31,7 @@ _PROCESS_BOOT_ID = f"process:{uuid4()}"
 _STORAGE_ERROR = "Could not verify the Conso request budget on disk"
 _COOLDOWN_ERROR = "Conso requests are paused for this meter"
 _INITIAL_PAUSE_ERROR = "Conso requests are paused for 24 hours after budget initialization"
+DAILY_ATTEMPT_USED = "The daily Linky refresh has already been attempted for this meter"
 
 
 class ConsoBudgetError(HomeAssistantError):
@@ -220,12 +222,13 @@ class ConsoBudget:
         async with self._lock:
             await self._async_read()
 
-    async def _async_check_capacity(
+    async def _async_capacity(
         self, data: _BudgetData, meter: _MeterBudget, prm: str, now: float, required: int
-    ) -> list[float]:
+    ) -> tuple[list[float], ConsoBudgetExceeded | None]:
+        requests = [stamp for stamp in meter["requests"] if stamp > now - _WINDOW]
         limit_error = "Conso request limit reached for this meter"
         if required > _LIMIT:
-            raise ConsoBudgetExceeded(limit_error)
+            return requests, ConsoBudgetExceeded(limit_error)
 
         known = self._unconfirmed_cooldowns.get(prm, 0)
         cooldown = meter["cooldown_until"]
@@ -237,7 +240,6 @@ class ConsoBudget:
 
         cooldown_until = max(cooldown or 0, known)
         pause_until = data["initial_pause_until"]
-        requests = [stamp for stamp in meter["requests"] if stamp > now - _WINDOW]
         needed = len(requests) + required - _LIMIT
         if pause_until > now:
             message = _INITIAL_PAUSE_ERROR
@@ -246,11 +248,34 @@ class ConsoBudget:
         elif needed > 0:
             message = limit_error
         else:
-            return requests
+            return requests, None
 
         available_at = sorted(requests)[needed - 1] + _WINDOW if needed > 0 else now
         retry_at = max(pause_until, cooldown_until, available_at)
-        raise ConsoBudgetExceeded(message, retry_in=max(0.0, retry_at - self._now()))
+        return requests, ConsoBudgetExceeded(message, retry_in=max(0.0, retry_at - self._now()))
+
+    async def async_get_status(self, prm: str, *, required: int) -> dict[str, Any]:
+        """Check capacity without claiming a day or reserving a request."""
+        async with self._lock:
+            data = await self._async_read()
+            meter = self._meter(data["meters"], prm)
+            requests, blocked = await self._async_capacity(data, meter, prm, self._now(), required)
+            reason = str(blocked) if blocked else None
+            retry_in = blocked.retry_in if blocked else None
+            day = meter["day"]
+            now = dt_util.now(PARIS_TZ)
+            if day is not None and day >= now.date().isoformat():
+                next_day = date.fromisoformat(day) + timedelta(days=1)
+                next_slot = datetime.combine(next_day, time(), PARIS_TZ)
+                reason = reason or DAILY_ATTEMPT_USED
+                retry_in = max(retry_in or 0.0, next_slot.timestamp() - now.timestamp())
+            return {
+                "requests_remaining": max(0, _LIMIT - len(requests)),
+                "last_daily_attempt": day,
+                "can_refresh": reason is None,
+                "blocking_reason": reason,
+                "retry_in_seconds": retry_in,
+            }
 
     @asynccontextmanager
     async def daily_batch(self, prm: str, day: date, *, required: int = 1) -> AsyncIterator[bool]:
@@ -262,7 +287,9 @@ class ConsoBudget:
             if meter["day"] is None or meter["day"] < day_key:
                 if type(required) is not int or required < 1:
                     raise ValueError("A daily claim must require at least one request")
-                await self._async_check_capacity(data, meter, prm, self._now(), required)
+                _, blocked = await self._async_capacity(data, meter, prm, self._now(), required)
+                if blocked is not None:
+                    raise blocked
                 meter["day"] = day_key
                 await self._async_save(data)
                 self._batch_owner = current_task()
@@ -280,7 +307,9 @@ class ConsoBudget:
         async with nullcontext() if in_batch else self._lock:
             data = await self._async_read()
             meter = self._meter(data["meters"], prm)
-            requests = await self._async_check_capacity(data, meter, prm, self._now(), 1)
+            requests, blocked = await self._async_capacity(data, meter, prm, self._now(), 1)
+            if blocked is not None:
+                raise blocked
 
             loop = get_running_loop()
             delay = self._send_after - loop.time()
