@@ -6,13 +6,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from freezegun import freeze_time
-from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
+from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE, ConfigEntryState
 from homeassistant.core import Context, HomeAssistant
-from homeassistant.exceptions import ServiceValidationError, Unauthorized
+from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError, Unauthorized
 
 from custom_components.linky import SERVICE_IMPORT_HISTORICAL_DATA
-from custom_components.linky.api import APIError, AuthenticationError, NoDataError
-from custom_components.linky.const import CONF_COLLECT_EXPORT, CONF_SCAN_INTERVAL, DOMAIN
+from custom_components.linky.api import AuthenticationError
+from custom_components.linky.const import CONF_COLLECT_EXPORT, CONF_DAILY_ONLY, DOMAIN
 
 pytestmark = pytest.mark.usefixtures("recorder_mock")
 
@@ -24,7 +25,8 @@ async def test_setup_entry(
     assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     assert mock_config_entry.state is ConfigEntryState.LOADED
     assert mock_config_entry.runtime_data.client is mock_linky_client
-    assert mock_config_entry.runtime_data.update_interval.total_seconds() == 12 * 3600
+    mock_linky_client.get_consumption_load_curve.assert_not_awaited()
+    mock_linky_client.get_daily_consumption.assert_not_awaited()
 
     assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
     assert mock_config_entry.state is ConfigEntryState.NOT_LOADED
@@ -32,58 +34,102 @@ async def test_setup_entry(
     mock_http_session.close.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("failure", "expected_state", "needs_reauth"),
-    [
-        (AuthenticationError("Bearer rejected", 401), ConfigEntryState.SETUP_ERROR, True),
-        (APIError("Could not connect to Conso API"), ConfigEntryState.SETUP_RETRY, False),
-        (NoDataError("Enedis returned no measurements", 404), ConfigEntryState.LOADED, False),
-    ],
-)
-async def test_first_refresh_provider_response(
-    hass: HomeAssistant, mock_linky_client, mock_config_entry, failure, expected_state, needs_reauth
+async def test_scheduled_refresh_requests_reauth_for_a_rejected_token(
+    hass: HomeAssistant, mock_linky_client, mock_config_entry
 ) -> None:
-    """Keep a meter with no readings and distinguish outages from rejected credentials."""
-    for method in (
-        mock_linky_client.get_daily_consumption,
-        mock_linky_client.get_consumption_load_curve,
-        mock_linky_client.get_max_power,
-        mock_linky_client.get_daily_production,
-        mock_linky_client.get_production_load_curve,
-    ):
-        method.side_effect = failure
-
-    loaded = await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    """A real 401 during the scheduled refresh still asks for a new token."""
+    mock_linky_client.get_consumption_load_curve.side_effect = AuthenticationError(
+        "Bearer rejected", 401
+    )
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await mock_config_entry.runtime_data.async_refresh()
     await hass.async_block_till_done()
 
-    assert loaded is (expected_state is ConfigEntryState.LOADED)
-    assert mock_config_entry.state is expected_state
     flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
-    assert any(flow["context"]["source"] == SOURCE_REAUTH for flow in flows) is needs_reauth
+    assert any(flow["context"]["source"] == SOURCE_REAUTH for flow in flows)
 
 
 async def test_reload_from_options(
     hass: HomeAssistant, mock_linky_client, mock_config_entry
 ) -> None:
-    """Saving options reloads the entry with the new interval and export setting."""
+    """Saving collection options reloads the entry without sending a request."""
     assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     previous_coordinator = mock_config_entry.runtime_data
-    mock_linky_client.get_daily_production.assert_awaited_once()
-    mock_linky_client.get_production_load_curve.assert_awaited_once()
-    mock_linky_client.reset_mock()
 
     result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
     await hass.config_entries.options.async_configure(
-        result["flow_id"], {CONF_SCAN_INTERVAL: 8, CONF_COLLECT_EXPORT: False}
+        result["flow_id"], {CONF_DAILY_ONLY: True, CONF_COLLECT_EXPORT: False}
     )
     await hass.async_block_till_done()
 
     assert mock_config_entry.state is ConfigEntryState.LOADED
     assert mock_config_entry.runtime_data is not previous_coordinator
-    assert mock_config_entry.runtime_data.update_interval.total_seconds() == 8 * 3600
+    mock_linky_client.get_daily_consumption.assert_not_awaited()
+    await mock_config_entry.runtime_data.async_refresh()
     mock_linky_client.get_daily_consumption.assert_awaited_once()
+    mock_linky_client.get_consumption_load_curve.assert_not_awaited()
     mock_linky_client.get_daily_production.assert_not_awaited()
     mock_linky_client.get_production_load_curve.assert_not_awaited()
+
+
+async def test_refresh_import_and_reconfigure_share_one_request_budget(
+    hass: HomeAssistant, mock_config_entry, single_prm_token: str, mock_http_session: MagicMock
+) -> None:
+    """All three callers share the same cap, and restarts don't refetch before the timer."""
+    entry = mock_config_entry
+    hass.config_entries.async_update_entry(
+        entry, options={CONF_DAILY_ONLY: True, CONF_COLLECT_EXPORT: False}
+    )
+    reply = mock_http_session.get.return_value.__aenter__.return_value
+    reply.status = 200
+    reply.headers = {}
+    reply.json = AsyncMock(
+        return_value={
+            "idPrm": entry.data["prm"],
+            "periode": {"dateDebut": "2026-01-02", "dateFin": "2026-01-03"},
+            "grandeur": [
+                {
+                    "grandeurMetier": "CONS",
+                    "grandeurPhysique": "EA",
+                    "unite": "Wh",
+                    "points": [{"d": "2026-01-02", "v": "1200"}],
+                }
+            ],
+        }
+    )
+
+    async def import_day() -> None:
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_IMPORT_HISTORICAL_DATA,
+            {"config_entry_id": entry.entry_id, "start_date": "2026-01-02"},
+            blocking=True,
+        )
+
+    with freeze_time("2026-01-03 10:00:00", real_asyncio=True):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        mock_http_session.get.assert_not_called()
+        await entry.runtime_data.async_refresh()
+        await entry.runtime_data.async_refresh()
+        mock_http_session.get.assert_called_once()
+
+        await import_day()
+        assert mock_http_session.get.call_count == 2
+
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id}
+        )
+        with patch.object(hass.config_entries, "async_schedule_reload"):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"], {"token": single_prm_token}
+            )
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "reconfigure_successful"
+        assert mock_http_session.get.call_count == 3
+
+        with pytest.raises(HomeAssistantError, match="(?i)budget|limit"):
+            await import_day()
+        assert mock_http_session.get.call_count == 3
 
 
 async def test_import_targets_selected_loaded_meter(
@@ -98,7 +144,6 @@ async def test_import_targets_selected_loaded_meter(
         get_daily_production=AsyncMock(return_value=None),
         get_consumption_load_curve=AsyncMock(return_value=None),
         get_production_load_curve=AsyncMock(return_value=None),
-        get_max_power=AsyncMock(return_value=None),
     )
     with patch("custom_components.linky.LinkyClient", return_value=second_client):
         assert await hass.config_entries.async_setup(second.entry_id)

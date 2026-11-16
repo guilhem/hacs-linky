@@ -13,7 +13,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 
 from custom_components.linky.api import PRMAccessError
-from custom_components.linky.const import CONF_COLLECT_EXPORT, CONF_PRM, CONF_SCAN_INTERVAL, DOMAIN
+from custom_components.linky.const import CONF_COLLECT_EXPORT, CONF_PRM, DOMAIN
 
 
 def _mock_error_reply(reply: MagicMock, status: int, body: dict | None) -> None:
@@ -148,7 +148,7 @@ async def test_form_provider_response(
     assert args == ("https://conso.boris.sh/api/consommation_quotidienne",)
     assert kwargs["params"] == {
         "pointId": "12345678901234",
-        "dateDebut": "2025-12-31",
+        "dateDebut": "2026-01-02",
         "dateFin": "2026-01-03",
     }
     assert kwargs["headers"]["Authorization"] == f"Bearer {single_prm_token}"
@@ -194,13 +194,14 @@ async def test_reconfigure_token_during_setup_retry(
     single_prm_token: str,
     multi_prm_token: str,
     mock_http_session: MagicMock,
+    budget_clock,
 ) -> None:
     """Keep the existing meter and reload only after the provider accepts the new token."""
     prm = "98765432109876"
     entry = await add_linky_entry(prm, "old-token")
     entry_id = entry.entry_id
     original_data = dict(entry.data)
-    options = {CONF_COLLECT_EXPORT: False, CONF_SCAN_INTERVAL: 12}
+    options = {CONF_COLLECT_EXPORT: False, "scan_interval": 12}
     hass.config_entries.async_update_entry(entry, options=options)
     entry._async_set_state(hass, config_entries.ConfigEntryState.SETUP_RETRY, None)
 
@@ -245,11 +246,20 @@ async def test_reconfigure_token_during_setup_retry(
         assert entry.data == original_data
         reload_entry.assert_not_called()
 
+        result = await hass.config_entries.flow.async_configure(
+            flow_id, {CONF_TOKEN: multi_prm_token}
+        )
+        assert result["errors"] == {"base": "conso_budget_exhausted"}
+        assert mock_http_session.get.call_count == 2
+        assert entry.data == original_data
+        reload_entry.assert_not_called()
+
         _mock_error_reply(
             reply,
             404,
             {"message": "The Enedis API returned an error", "error": {"error": "no_data_found"}},
         )
+        budget_clock.elapsed += 48 * 60 * 60
         result = await hass.config_entries.flow.async_configure(
             flow_id, {CONF_TOKEN: multi_prm_token}
         )
@@ -331,7 +341,5 @@ async def test_newly_activated_meter_can_be_configured(
         )
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert [call.kwargs["params"]["dateDebut"] for call in session.get.call_args_list] == [
-        "2025-12-31",
-        "2026-01-02",
-    ]
+    session.get.assert_called_once()
+    assert session.get.call_args.kwargs["params"]["dateDebut"] == "2026-01-02"

@@ -4,7 +4,8 @@ from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from shutil import copytree
-from types import MappingProxyType
+from time import time
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,7 +22,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.recorder import async_initialize_recorder, get_instance
 from homeassistant.setup import async_setup_component
 
+from custom_components.linky import budget as budget_module
 from custom_components.linky.api import IntervalReading, MeteringData
+from custom_components.linky.budget import async_get_conso_budget
 from custom_components.linky.const import CONF_PRM, DOMAIN
 
 PRM = "12345678901234"
@@ -38,7 +41,18 @@ def mock_http_session() -> MagicMock:
 
 
 @pytest.fixture
-async def hass(tmp_path: Path, mock_http_session: MagicMock) -> AsyncIterator[HomeAssistant]:
+def budget_clock(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    start = time()
+    clock = SimpleNamespace(elapsed=0.0)
+    monkeypatch.setattr(budget_module, "time", lambda: start + clock.elapsed)
+    monkeypatch.setattr(budget_module, "monotonic", lambda: clock.elapsed)
+    return clock
+
+
+@pytest.fixture
+async def hass(
+    tmp_path: Path, mock_http_session: MagicMock, budget_clock: SimpleNamespace
+) -> AsyncIterator[HomeAssistant]:
     """Start real Home Assistant with the custom integration and SQLite."""
     copytree(Path(__file__).parents[1] / "custom_components", tmp_path / "custom_components")
     home = HomeAssistant(str(tmp_path))
@@ -51,6 +65,8 @@ async def hass(tmp_path: Path, mock_http_session: MagicMock) -> AsyncIterator[Ho
     async_initialize_recorder(home)
     assert await async_setup_component(home, "recorder", {"recorder": {"auto_purge": False}})
     await home.async_start()
+    await async_get_conso_budget(home).async_initialize()
+    budget_clock.elapsed += 24 * 60 * 60
     try:
         with (
             patch(
@@ -152,26 +168,9 @@ def load_curve_data() -> MeteringData:
     )
 
 
-@pytest.fixture
-def max_power_data() -> MeteringData:
-    """Sample daily peak apparent power."""
-    return MeteringData(
-        PRM,
-        START,
-        END,
-        [
-            IntervalReading(datetime(2024, 1, 1, 8), 6200),
-            IntervalReading(datetime(2024, 1, 2, 10), 7100),
-            IntervalReading(datetime(2024, 1, 7, 19), 5800),
-        ],
-        "VA",
-    )
-
-
 def _create_mock_client(
     daily_consumption: MeteringData,
     load_curve: MeteringData,
-    peak: MeteringData,
     prms: list[str],
 ) -> Iterator[MagicMock]:
     """Replace only the provider at the integration boundary."""
@@ -180,7 +179,6 @@ def _create_mock_client(
         prms=prms,
         get_daily_consumption=AsyncMock(return_value=daily_consumption),
         get_consumption_load_curve=AsyncMock(return_value=load_curve),
-        get_max_power=AsyncMock(return_value=peak),
         get_daily_production=AsyncMock(return_value=None),
         get_production_load_curve=AsyncMock(return_value=None),
     )
@@ -195,22 +193,18 @@ def _create_mock_client(
 def mock_linky_client(
     daily_consumption_data: MeteringData,
     load_curve_data: MeteringData,
-    max_power_data: MeteringData,
 ) -> Iterator[MagicMock]:
     """Simulate Conso for a single meter."""
-    yield from _create_mock_client(daily_consumption_data, load_curve_data, max_power_data, [PRM])
+    yield from _create_mock_client(daily_consumption_data, load_curve_data, [PRM])
 
 
 @pytest.fixture
 def mock_linky_client_multi_prm(
     daily_consumption_data: MeteringData,
     load_curve_data: MeteringData,
-    max_power_data: MeteringData,
 ) -> Iterator[MagicMock]:
     """Simulate Conso for multiple meters."""
-    yield from _create_mock_client(
-        daily_consumption_data, load_curve_data, max_power_data, [PRM, OTHER_PRM]
-    )
+    yield from _create_mock_client(daily_consumption_data, load_curve_data, [PRM, OTHER_PRM])
 
 
 @pytest.fixture

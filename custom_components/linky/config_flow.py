@@ -19,9 +19,6 @@ from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
     BooleanSelector,
-    NumberSelector,
-    NumberSelectorConfig,
-    NumberSelectorMode,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -38,17 +35,14 @@ from .api import (
     LinkyClient,
     NoDataError,
     PRMAccessError,
-    fetch_recent,
 )
+from .budget import ConsoBudgetError, ConsoBudgetExceeded, async_get_conso_budget
 from .const import (
     CONF_COLLECT_EXPORT,
+    CONF_DAILY_ONLY,
     CONF_PRM,
-    CONF_SCAN_INTERVAL,
     DEFAULT_COLLECT_EXPORT,
-    DEFAULT_SCAN_INTERVAL_HOURS,
     DOMAIN,
-    MAX_SCAN_INTERVAL_HOURS,
-    MIN_SCAN_INTERVAL_HOURS,
     PARIS_TZ,
 )
 
@@ -66,26 +60,13 @@ class LinkyOptionsFlow(OptionsFlowWithReload):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current_interval = self.config_entry.options.get(
-            CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS
-        )
+        daily_only = self.config_entry.options.get(CONF_DAILY_ONLY, False)
         collect_export = self.config_entry.options.get(CONF_COLLECT_EXPORT, DEFAULT_COLLECT_EXPORT)
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
                 {
-                    vol.Required(
-                        CONF_SCAN_INTERVAL,
-                        default=current_interval,
-                    ): NumberSelector(
-                        NumberSelectorConfig(
-                            min=MIN_SCAN_INTERVAL_HOURS,
-                            max=MAX_SCAN_INTERVAL_HOURS,
-                            step=1,
-                            mode=NumberSelectorMode.SLIDER,
-                            unit_of_measurement="h",
-                        )
-                    ),
+                    vol.Required(CONF_DAILY_ONLY, default=daily_only): BooleanSelector(),
                     vol.Required(CONF_COLLECT_EXPORT, default=collect_export): BooleanSelector(),
                 }
             ),
@@ -113,17 +94,27 @@ class LinkyConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> tuple[list[str], str | None]:
         """Discover meters and check API access once the meter is known."""
         try:
-            client = LinkyClient(async_get_clientsession(self.hass), token, prm=prm)
+            client = LinkyClient(
+                async_get_clientsession(self.hass),
+                token,
+                budget=async_get_conso_budget(self.hass),
+                prm=prm,
+            )
             if prm is not None or len(client.prms) == 1:
                 end = dt_util.now(PARIS_TZ).date()
                 # Both responses confirm access; a new meter may have no completed day yet.
                 with suppress(NoDataError, HistoryLimitError):
-                    await fetch_recent(client.get_daily_consumption, end - timedelta(days=3), end)
+                    await client.get_daily_consumption(end - timedelta(days=1), end)
             return client.prms, None
         except AuthenticationError:
             return [], "invalid_token"
         except PRMAccessError:
             return [], "prm_access_denied"
+        except ConsoBudgetExceeded:
+            return [], "conso_budget_exhausted"
+        except ConsoBudgetError as err:
+            _LOGGER.warning("The Linky token could not be checked: %s", err)
+            return [], "conso_budget_unavailable"
         except APIError as err:
             _LOGGER.warning("Could not verify access to the Linky meter: %s", err)
             if err.status_code == 403:

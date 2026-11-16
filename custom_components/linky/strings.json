@@ -35,7 +35,9 @@
       "prm_access_denied": "This token does not grant access to this meter",
       "unknown": "Unexpected error",
       "cannot_connect": "The Conso API request failed. Check the Home Assistant logs for details.",
-      "provider_forbidden": "Conso API refused the request (HTTP 403). The submitted token was not saved. If it keeps happening, check the Home Assistant logs."
+      "provider_forbidden": "Conso API refused the request (HTTP 403). The submitted token was not saved. If it keeps happening, check the Home Assistant logs.",
+      "conso_budget_exhausted": "No request was sent. Wait until the initial 24-hour pause, meter request limit, or Conso cooldown has ended.",
+      "conso_budget_unavailable": "No request was sent because Home Assistant could not verify the Conso request budget. Check the logs."
     },
     "abort": {
       "already_configured": "This meter is already configured",
@@ -48,12 +50,12 @@
       "init": {
         "title": "Linky Options",
         "data": {
-          "scan_interval": "Update interval",
-          "collect_export": "Collect grid export"
+          "collect_export": "Collect grid export",
+          "daily_only": "Daily totals only"
         },
         "data_description": {
           "collect_export": "Enable if this meter measures electricity sent to the grid. Also applies to historical imports.",
-          "scan_interval": "How often to fetch data (in hours). Linky data has a 24-48h delay."
+          "daily_only": "Enable if the Enedis load curve is unavailable. Energy will only receive daily totals."
         }
       }
     }
@@ -61,7 +63,7 @@
   "services": {
     "import_historical_data": {
       "name": "Import historical data",
-      "description": "Import historical consumption and, if collection is enabled, grid export for the selected meter.",
+      "description": "Import up to seven days of readings. Requests count toward the meter's request limit.",
       "fields": {
         "config_entry_id": {
           "name": "Linky meter",
@@ -86,9 +88,6 @@
       "current_power": {
         "name": "Latest average consumption power"
       },
-      "max_power": {
-        "name": "Daily maximum apparent power"
-      },
       "daily_production": {
         "name": "Daily export"
       },
@@ -100,7 +99,7 @@
   "issues": {
     "conso_forbidden": {
       "title": "Linky refresh refused (meter ending in {meter})",
-      "description": "Conso API returned HTTP 403 on two consecutive daily consumption refreshes. The status alone does not identify the cause. Linky will try again at the next scheduled refresh. Check the Home Assistant logs for details."
+      "description": "Conso API returned HTTP 403 on two consecutive consumption refreshes. The status alone does not identify the cause. Check the Home Assistant logs for details."
     }
   }
 }

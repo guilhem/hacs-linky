@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -16,16 +17,18 @@ from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import dt as dt_util
 
 from .api import AuthenticationError, LinkyClient, PRMAccessError
+from .budget import ConsoBudgetError, async_get_conso_budget
 from .const import (
     CONF_COLLECT_EXPORT,
+    CONF_DAILY_ONLY,
     CONF_PRM,
-    CONF_SCAN_INTERVAL,
     DEFAULT_COLLECT_EXPORT,
-    DEFAULT_SCAN_INTERVAL_HOURS,
     DOMAIN,
     PARIS_TZ,
 )
 from .coordinator import LinkyDataUpdateCoordinator
+
+_LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 PLATFORMS: list[Platform] = [Platform.SENSOR]
@@ -47,7 +50,11 @@ SERVICE_IMPORT_HISTORICAL_DATA_SCHEMA = vol.Schema(
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Register the Linky action once for all meters."""
+    """Initialize scheduling state and register the Linky action."""
+    try:
+        await async_get_conso_budget(hass).async_initialize()
+    except ConsoBudgetError as err:
+        _LOGGER.error("Could not initialize the Linky request budget: %s", err)
 
     async def handle_import_historical_data(call: ServiceCall) -> None:
         """Import statistics for the selected loaded meter."""
@@ -91,7 +98,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> boo
     """Set up Linky from a config entry."""
     try:
         client = LinkyClient(
-            async_get_clientsession(hass), entry.data[CONF_TOKEN], prm=entry.data[CONF_PRM]
+            async_get_clientsession(hass),
+            entry.data[CONF_TOKEN],
+            budget=async_get_conso_budget(hass),
+            prm=entry.data[CONF_PRM],
         )
     except (AuthenticationError, PRMAccessError) as err:
         raise ConfigEntryAuthFailed(
@@ -101,13 +111,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> boo
     coordinator = LinkyDataUpdateCoordinator(
         hass,
         client,
-        scan_interval_hours=entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS),
         collect_export=entry.options.get(CONF_COLLECT_EXPORT, DEFAULT_COLLECT_EXPORT),
+        daily_only=entry.options.get(CONF_DAILY_ONLY, False),
         config_entry=entry,
     )
-    await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    coordinator.async_start()
     return True
 
 

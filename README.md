@@ -4,8 +4,9 @@ Bring the electricity measured by your Linky meter into Home Assistant's **Energ
 
 Home Assistant fetches readings through [Conso API](https://conso.boris.sh/), using
 [Enedis Mesure synchrone V2](https://conso.boris.sh/migration-2026/). Enedis publishes
-readings after the day they were measured, usually the following morning. A power
-sensor shows the latest *published* measurement; it cannot track a live load.
+readings after the day they were measured, usually the following morning. Linky
+refreshes once each morning in Paris time. A power sensor shows the latest
+*published* interval; it cannot track a live load.
 
 ```mermaid
 flowchart LR
@@ -29,9 +30,11 @@ with Enedis; hourly Energy charts also require access to the load curve.
    directory and restart.
 3. Open **Settings → Devices & services → Add integration → Linky** and enter
    the token. If the token covers multiple meters, select the meter you want.
-   Run the setup again for each additional meter.
-4. Open the Linky device page. **Daily consumption** displays the latest
-   published day, and its `last_date` attribute tells you when it was measured.
+   Run the setup again for each additional meter. If the request budget was
+   just initialized, wait 24 hours before submitting the token again.
+4. After the next scheduled refresh, open the Linky device page.
+   **Daily consumption** displays the latest published day. Its `last_date`
+   attribute tells you when it was measured.
 
 ## Change a meter's settings
 
@@ -40,11 +43,24 @@ Open **Settings → Devices & services → Linky** and use the meter's menu:
 - **Reconfigure** replaces the Conso token for this meter. Home Assistant
   verifies that the new token works for the same meter before saving it.
   Your entities, preferences, and Energy history stay in place.
-- **Configure** sets the update interval (12 hours by default) and whether to
-  collect grid export. Export collection is off for newly added meters and
-  stays on for existing meters until you turn it off. Enable it if you send
-  electricity back to the grid. The setting applies to scheduled updates and
-  historical imports. Readings already in Energy are kept.
+- **Configure** controls grid export collection and **Daily totals only**.
+  The default uses one consumption load-curve request to fill both hourly and
+  daily Energy statistics. Choose **Daily totals only** if your meter does not
+  have a load curve, and select the daily statistic in Energy. This mode
+  does not update the average power sensor.
+- Export collection is off for newly added meters. Enable it if you send
+  electricity back to the grid. It uses one additional request per refresh.
+  These settings also apply to historical imports. Existing Energy history is
+  kept. The daily maximum apparent power sensor is no longer updated, because
+  that measurement requires its own request.
+
+Linky allows up to **three Conso requests per meter in any 24-hour period**,
+including token checks, failed requests, and manual imports. Home Assistant
+remembers this budget across restarts. Startup does not trigger a refresh.
+The first time the budget is initialized, Linky waits 24 hours so any requests
+from a previous version can age out. The scheduled morning refresh fills in
+available readings from the previous seven days.
+See [Conso's usage rules](https://conso.boris.sh/blocage-ip).
 
 Export measures electricity sent to the grid. For the latest export readings
 on the device page, also enable the export sensors in the meter's entity list.
@@ -67,10 +83,13 @@ a cost for an external statistic, Energy needs a separate cost statistic.
 Go to **Developer Tools → Actions** and select **Linky: Import historical data**.
 Select the meter, enter the first day to include, then enter the first day to
 exclude. For example, **2026-10-01** to **2026-10-08** imports the first seven
-days of October. The end defaults to today in Paris. Import up to 30 days at a
-time. A partial result reports missing or failed data; you can run the same
-range again to pick up late or corrected readings without double counting.
-An incomplete hour or an ambiguous timestamp at the clock change is left as a gap.
+days of October. The end defaults to today in Paris. Import at most seven days
+at a time, within the same request budget as the scheduled refresh. A partial
+result reports missing or failed data. You can import the same dates again
+without double counting once the oldest attempts are more than 24 hours old. Missing hours are left as
+gaps, and a day is not added to the daily statistics until its load curve is
+complete. For a large history, use the provider's
+[Conso Downloader](https://github.com/bokub/conso-downloader).
 
 ## If data is missing
 

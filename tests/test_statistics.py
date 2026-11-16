@@ -19,6 +19,7 @@ from custom_components.linky.const import PARIS_TZ
 from custom_components.linky.statistics import (
     async_write_statistics,
     daily_energy,
+    daily_from_hourly,
     hourly_energy,
     paris_midnight,
 )
@@ -29,15 +30,18 @@ _DAY = timedelta(days=1)
 
 
 @pytest.mark.parametrize(
-    ("day", "naive", "expected_count"),
+    ("day", "naive", "expected_hours", "expected_kwh"),
     [
-        (date(2024, 3, 31), True, 23),
-        (date(2024, 10, 27), False, 25),
-        (date(2024, 10, 27), True, 22),
+        (date(2024, 1, 1), False, 24, 24.0),
+        (date(2024, 3, 31), True, 23, 23.0),
+        (date(2024, 10, 27), False, 25, 26.0),
+        (date(2024, 10, 27), True, 22, None),
     ],
 )
-def test_dst(day: date, naive: bool, expected_count: int) -> None:
-    """Retain both offset-aware folds; skip hours tainted by naive ambiguous endpoints."""
+def test_daily_from_curve(
+    day: date, naive: bool, expected_hours: int, expected_kwh: float | None
+) -> None:
+    """Only complete Paris days contribute to daily totals, including across DST."""
     end = day + _DAY
     lower, upper = paris_midnight(day), paris_midnight(end)
     readings = []
@@ -48,12 +52,21 @@ def test_dst(day: date, naive: bool, expected_count: int) -> None:
         stamp = local.replace(tzinfo=None) if naive else datetime.fromisoformat(local.isoformat())
         readings.append(IntervalReading(stamp, value, _HALF_HOUR))
 
-    buckets = hourly_energy(MeteringData(_PRM, day, end, list(reversed(readings)), "W"), day, end)
-    assert len(buckets) == expected_count
+    data = MeteringData(_PRM, day, end, list(reversed(readings)), "W")
+    buckets = hourly_energy(data, day, end)
+    assert len(buckets) == expected_hours
     assert upper - timedelta(hours=1) in buckets  # midnight is the end of the final interval
-    if not naive:
+    if expected_hours == 25:
         assert buckets[datetime(2024, 10, 27, 0, tzinfo=UTC)] == 1.5
         assert buckets[datetime(2024, 10, 27, 1, tzinfo=UTC)] == 1.5
+
+    assert daily_from_hourly(buckets, day, end) == (
+        {} if expected_kwh is None else {lower: expected_kwh}
+    )
+    if expected_kwh is not None:
+        for incomplete in (readings[1:], [*readings, readings[0]]):
+            buckets = hourly_energy(MeteringData(_PRM, day, end, incomplete, "W"), day, end)
+            assert daily_from_hourly(buckets, day, end) == {}
 
 
 def test_only_complete_measured_hours() -> None:
