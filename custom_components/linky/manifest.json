@@ -1,6 +1,7 @@
 {
   "domain": "linky",
   "name": "Linky",
+  "categories": ["energy.meters_monitoring"],
   "codeowners": ["@guilhem"],
   "config_flow": true,
   "dependencies": ["recorder"],

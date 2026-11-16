@@ -34,8 +34,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # HACS reads GitHub's default-branch license metadata, so check the PR file here.
+      - run: test -s LICENSE
       - uses: hacs/action@main
         with:
           category: integration
-          # Custom repository; no listing or central brand assets.
-          ignore: brands description topics
+          # This custom repository is not listed in HACS defaults.
+          ignore: ${{ github.event_name == 'pull_request' && 'brands description topics license' || 'brands description topics' }}
