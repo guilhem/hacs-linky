@@ -1,6 +1,6 @@
 import_historical_data:
   name: Import historical data
-  description: Import historical consumption and, if collection is enabled, grid export for the selected meter.
+  description: Import up to seven days of readings. Requests count toward the meter's request limit.
   fields:
     config_entry_id:
       name: Linky meter

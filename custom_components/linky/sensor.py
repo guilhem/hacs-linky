@@ -4,22 +4,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time
-from typing import Any
 
-from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorEntityDescription
-from homeassistant.const import UnitOfApparentPower, UnitOfEnergy, UnitOfPower
-from homeassistant.core import HomeAssistant
+from homeassistant.components.sensor import (
+    RestoreSensor,
+    SensorDeviceClass,
+    SensorEntityDescription,
+)
+from homeassistant.const import STATE_UNAVAILABLE, UnitOfEnergy, UnitOfPower
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import LinkyConfigEntry
-from .api import IntervalReading, MeteringData
+from .api import IntervalReading
 from .const import (
     ATTR_LAST_DATE,
     ATTR_LAST_VALUE,
     ATTR_QUALITY,
     ATTR_USAGE_POINT_ID,
+    CONF_COLLECT_EXPORT,
+    CONF_DAILY_ONLY,
+    DEFAULT_COLLECT_EXPORT,
     DOMAIN,
     PARIS_TZ,
 )
@@ -31,6 +37,7 @@ class LinkySensorDescription(SensorEntityDescription):
     """Describe a published meter reading."""
 
     data_key: str
+    requires_export: bool = False
 
 
 SENSORS = (
@@ -49,16 +56,10 @@ SENSORS = (
         device_class=SensorDeviceClass.POWER,
     ),
     LinkySensorDescription(
-        key="max_power",
-        translation_key="max_power",
-        data_key="max_power",
-        native_unit_of_measurement=UnitOfApparentPower.VOLT_AMPERE,
-        device_class=SensorDeviceClass.APPARENT_POWER,
-    ),
-    LinkySensorDescription(
         key="daily_production",
         translation_key="daily_production",
         data_key="daily_production",
+        requires_export=True,
         native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
         entity_registry_enabled_default=False,
@@ -67,6 +68,7 @@ SENSORS = (
         key="current_production_power",
         translation_key="current_production_power",
         data_key="production_load_curve",
+        requires_export=True,
         native_unit_of_measurement=UnitOfPower.WATT,
         device_class=SensorDeviceClass.POWER,
         entity_registry_enabled_default=False,
@@ -91,7 +93,7 @@ async def async_setup_entry(
     async_add_entities(LinkySensor(entry, description) for description in SENSORS)
 
 
-class LinkySensor(CoordinatorEntity[LinkyDataUpdateCoordinator], SensorEntity):
+class LinkySensor(CoordinatorEntity[LinkyDataUpdateCoordinator], RestoreSensor):
     """A snapshot of a single measurement series."""
 
     entity_description: LinkySensorDescription
@@ -101,6 +103,13 @@ class LinkySensor(CoordinatorEntity[LinkyDataUpdateCoordinator], SensorEntity):
         """Set up the sensor and associate it with the meter."""
         super().__init__(entry.runtime_data)
         self.entity_description = description
+        self._collection_enabled = (
+            not description.requires_export
+            or entry.options.get(CONF_COLLECT_EXPORT, DEFAULT_COLLECT_EXPORT)
+        ) and (
+            description.device_class != SensorDeviceClass.POWER
+            or not entry.options.get(CONF_DAILY_ONLY, False)
+        )
         prm = self.coordinator.client.prm
         self._attr_unique_id = f"{prm}_{description.key}"
         self._attr_device_info = DeviceInfo(
@@ -111,39 +120,62 @@ class LinkySensor(CoordinatorEntity[LinkyDataUpdateCoordinator], SensorEntity):
             entry_type=DeviceEntryType.SERVICE,
         )
 
-    def _meter_data(self) -> MeteringData | None:
-        return getattr(self.coordinator.data, self.entity_description.data_key, None)
-
-    def _latest_reading(self, data: MeteringData) -> IntervalReading | None:
-        return max(
-            data.interval_reading,
-            key=lambda reading: _reading_time(reading).timestamp(),
-            default=None,
-        )
-
     @property
     def available(self) -> bool:
-        """Report availability only when the endpoint has a reading."""
-        return super().available and bool((data := self._meter_data()) and data.interval_reading)
+        """Report availability only when there is a usable reading."""
+        return super().available and self.native_value is not None
 
-    @property
-    def native_value(self) -> int | float | None:
-        """Return the latest reading rather than depending on API order."""
-        if (data := self._meter_data()) and (reading := self._latest_reading(data)):
-            return reading.value
-        return None
+    async def async_added_to_hass(self) -> None:
+        """Restore the last reading until the coordinator has a result."""
+        await super().async_added_to_hass()
+        if not self._collection_enabled or not self.coordinator.last_update_success:
+            return
+        if self.coordinator.data is not None:
+            self._set_latest_reading()
+            return
+        stored = await self.async_get_last_sensor_data()
+        state = await self.async_get_last_state()
+        if (
+            stored is not None
+            and stored.native_unit_of_measurement == self.native_unit_of_measurement
+            and isinstance(stored.native_value, (int, float))
+            and state is not None
+            and state.state != STATE_UNAVAILABLE
+        ):
+            self._attr_native_value = stored.native_value
+            self._attr_extra_state_attributes = {
+                key: state.attributes[key]
+                for key in (ATTR_LAST_DATE, ATTR_LAST_VALUE, ATTR_QUALITY, ATTR_USAGE_POINT_ID)
+                if key in state.attributes
+            }
 
-    @property
-    def extra_state_attributes(self) -> dict[str, Any] | None:
-        """Show when Conso measured this value."""
-        if (data := self._meter_data()) and (reading := self._latest_reading(data)):
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Replace the restored reading with the result of an attempted refresh."""
+        if self.coordinator.data is not None or not self.coordinator.last_update_success:
+            self._set_latest_reading()
+        super()._handle_coordinator_update()
+
+    def _set_latest_reading(self) -> None:
+        self._attr_native_value = None
+        self._attr_extra_state_attributes = None
+        if not self._collection_enabled or not self.coordinator.last_update_success:
+            return
+        data = getattr(self.coordinator.data, self.entity_description.data_key, None)
+        if data and (
+            reading := max(
+                data.interval_reading,
+                key=lambda reading: _reading_time(reading).timestamp(),
+                default=None,
+            )
+        ):
             reading_date = reading.date
             if isinstance(reading_date, datetime):
                 reading_date = _reading_time(reading).astimezone(PARIS_TZ)
-            return {
+            self._attr_native_value = reading.value
+            self._attr_extra_state_attributes = {
                 ATTR_LAST_DATE: reading_date.isoformat(),
                 ATTR_LAST_VALUE: reading.value,
                 ATTR_QUALITY: data.quality,
                 ATTR_USAGE_POINT_ID: data.usage_point_id,
             }
-        return None

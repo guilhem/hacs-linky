@@ -3,19 +3,29 @@
 from __future__ import annotations
 
 import re
-from asyncio import IncompleteReadError, sleep, timeout
-from collections.abc import Awaitable, Callable
+from asyncio import IncompleteReadError, timeout
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from json import loads
 from math import isfinite
 from typing import Any
 
 import jwt
-from aiohttp import ClientError, ClientResponse, ClientSession, ClientTimeout, ContentTypeError
+from aiohttp import (
+    ClientConnectionError,
+    ClientError,
+    ClientRequest,
+    ClientResponse,
+    ClientSession,
+    ClientTimeout,
+    ContentTypeError,
+)
+from aiohttp.client_middlewares import ClientHandlerType
 
-from .const import API_REQUEST_DELAY, PARIS_TZ, USER_AGENT
+from .budget import ConsoBudget
+from .const import PARIS_TZ, USER_AGENT
 
 _BASE_URL = "https://conso.boris.sh/api"
 _TIMEOUT = ClientTimeout(total=20)
@@ -77,36 +87,6 @@ class MeteringData:
     interval_reading: list[IntervalReading]
     unit: str
     quality: str | None = None
-
-
-async def fetch_recent(
-    read: Callable[[date, date], Awaitable[MeteringData]], start: date, end: date
-) -> MeteringData:
-    """Read a polling window, shortening it only after an Enedis history-limit error."""
-    result: MeteringData | APIError
-    try:
-        return await read(start, end)
-    except HistoryLimitError as err:
-        result = err
-
-    # Search the last week for the longest valid suffix without guessing the activation date.
-    low, high = 1, min(_MAX_CURVE_DAYS, (end - start).days - 1)
-    while low <= high:
-        days = (low + high) // 2
-        await sleep(API_REQUEST_DELAY)
-        try:
-            result = await read(end - timedelta(days=days), end)
-        except HistoryLimitError:
-            high = days - 1
-            continue
-        except NoDataError as err:
-            # Enedis accepted this range; an earlier start may still have readings.
-            result = err
-        low = days + 1
-
-    if isinstance(result, APIError):
-        raise result
-    return result
 
 
 def _request_date(value: date | str) -> date:
@@ -242,10 +222,29 @@ async def _check_status(response: ClientResponse) -> None:
     raise error_type(f"{message} ({diagnostic})", status)
 
 
+def _retry_after(response: ClientResponse) -> float:
+    """Get a 429 retry delay in seconds, if the header is valid."""
+    value = response.headers.get("Retry-After", "").strip()
+    if value:
+        try:
+            if value.isascii() and value.isdecimal():
+                delay = float(value)
+                return delay if isfinite(delay) else 0
+            when = parsedate_to_datetime(value)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=UTC)
+            return (when - datetime.now(UTC)).total_seconds()
+        except ValueError, OverflowError:
+            pass
+    return 0
+
+
 class LinkyClient:
     """Read meter data over Home Assistant's shared HTTP session."""
 
-    def __init__(self, session: ClientSession, token: str, *, prm: str | None = None) -> None:
+    def __init__(
+        self, session: ClientSession, token: str, *, budget: ConsoBudget, prm: str | None = None
+    ) -> None:
         if not isinstance(token, str) or not _JWT.fullmatch(token):
             raise InvalidTokenError("Invalid Conso API token format")
         try:
@@ -265,6 +264,7 @@ class LinkyClient:
         self.prm: str = self.prms[0] if prm is None else prm
         self._session = session
         self._token = token
+        self._budget = budget
 
     async def get_daily_consumption(self, start: date | str, end: date | str) -> MeteringData:
         """Fetch daily consumption in Wh."""
@@ -273,10 +273,6 @@ class LinkyClient:
     async def get_daily_production(self, start: date | str, end: date | str) -> MeteringData:
         """Fetch daily production in Wh."""
         return await self._get("production_quotidienne", start, end, "PROD", "EA", "Wh")
-
-    async def get_max_power(self, start: date | str, end: date | str) -> MeteringData:
-        """Fetch daily maximum apparent power (PMA) in VA."""
-        return await self._get("puissance_conso_max_quotidienne", start, end, "CONS", "PMA", "VA")
 
     async def get_consumption_load_curve(self, start: date | str, end: date | str) -> MeteringData:
         """Fetch average consumption power in W per measurement interval."""
@@ -304,31 +300,46 @@ class LinkyClient:
         if unit == "W" and (end_date - start_date).days > _MAX_CURVE_DAYS:
             raise APIError("A load curve request can span at most seven days", 400)
 
-        try:
-            async with self._session.get(
-                f"{_BASE_URL}/{endpoint}",
-                params={
-                    "pointId": self.prm,
-                    "dateDebut": start_date.isoformat(),
-                    "dateFin": end_date.isoformat(),
-                },
-                headers={
-                    "Authorization": f"Bearer {self._token}",
-                    "Accept": "application/json",
-                    "User-Agent": USER_AGENT,
-                },
-                timeout=_TIMEOUT,
-                allow_redirects=False,
-                raise_for_status=False,
-            ) as response:
-                await _check_status(response)
-                try:
-                    payload = await response.json()
-                except ValueError, ContentTypeError:
-                    raise APIError("Conso API returned invalid JSON", 200) from None
-        except TimeoutError:
-            raise APIError("Conso API request timed out") from None
-        except ClientError, OSError:
-            raise APIError("Could not connect to Conso API") from None
+        attempted = False
+
+        async def one_shot(request: ClientRequest, handler: ClientHandlerType) -> ClientResponse:
+            nonlocal attempted
+            if attempted:
+                raise ClientConnectionError("Conso request replay refused")
+            attempted = True
+            return await handler(request)
+
+        async with self._budget.request(self.prm) as mark_cooldown:
+            try:
+                async with self._session.get(
+                    f"{_BASE_URL}/{endpoint}",
+                    params={
+                        "pointId": self.prm,
+                        "dateDebut": start_date.isoformat(),
+                        "dateFin": end_date.isoformat(),
+                    },
+                    headers={
+                        "Authorization": f"Bearer {self._token}",
+                        "Accept": "application/json",
+                        "User-Agent": USER_AGENT,
+                    },
+                    timeout=_TIMEOUT,
+                    allow_redirects=False,
+                    raise_for_status=False,
+                    # aiohttp 3.14.5 replaces HA's redirect-only middleware here.
+                    # Redirects are disabled, so that middleware's check is unnecessary.
+                    middlewares=(one_shot,),
+                ) as response:
+                    if response.status in (403, 429):
+                        mark_cooldown(_retry_after(response) if response.status == 429 else 0)
+                    await _check_status(response)
+                    try:
+                        payload = await response.json()
+                    except ValueError, ContentTypeError:
+                        raise APIError("Conso API returned invalid JSON", 200) from None
+            except TimeoutError:
+                raise APIError("Conso API request timed out") from None
+            except ClientError, OSError:
+                raise APIError("Could not connect to Conso API") from None
 
         return _parse_data(payload, self.prm, business, physical, unit)

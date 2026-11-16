@@ -111,6 +111,20 @@ def hourly_energy(data: MeteringData, start: date, end: date) -> Buckets:
     return buckets
 
 
+def daily_from_hourly(hourly: Buckets, start: date, end: date) -> Buckets:
+    """Sum complete Paris days of hourly kWh, indexed by midnight in UTC."""
+    daily: Buckets = {}
+    for offset in range((end - start).days):
+        day = start + timedelta(days=offset)
+        lower = paris_midnight(day)
+        hours = (paris_midnight(day + timedelta(days=1)) - lower) // _HOUR
+        try:
+            daily[lower] = sum(hourly[lower + hour * _HOUR] for hour in range(hours))
+        except KeyError:
+            continue
+    return daily
+
+
 def daily_energy(data: MeteringData, start: date, end: date) -> Buckets:
     """Store measured daily energy at the start of the Paris calendar day."""
     if data.unit != "Wh":
