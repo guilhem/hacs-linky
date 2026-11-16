@@ -23,3 +23,25 @@ import_historical_data:
       example: "2024-12-31"
       selector:
         date:
+refresh:
+  name: Refresh now
+  description: Run the daily Linky refresh now if it has not been attempted today and the request budget allows it.
+  fields:
+    config_entry_id:
+      name: Linky meter
+      description: Select the Linky meter to refresh.
+      required: true
+      selector:
+        config_entry:
+          integration: linky
+get_status:
+  name: Get collection status
+  description: Show the request budget and whether the selected meter can refresh. Does not contact Conso.
+  fields:
+    config_entry_id:
+      name: Linky meter
+      description: Select the Linky meter to inspect.
+      required: true
+      selector:
+        config_entry:
+          integration: linky

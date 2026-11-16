@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Coroutine
+from typing import Any
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_TOKEN, Platform
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import ConfigEntryAuthFailed, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -36,10 +38,13 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 type LinkyConfigEntry = ConfigEntry[LinkyDataUpdateCoordinator]
 
 SERVICE_IMPORT_HISTORICAL_DATA = "import_historical_data"
+SERVICE_REFRESH = "refresh"
+SERVICE_GET_STATUS = "get_status"
 ATTR_CONFIG_ENTRY_ID = "config_entry_id"
 ATTR_START_DATE = "start_date"
 ATTR_END_DATE = "end_date"
 
+METER_ACTION_SCHEMA = vol.Schema({vol.Required(ATTR_CONFIG_ENTRY_ID): str})
 SERVICE_IMPORT_HISTORICAL_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_CONFIG_ENTRY_ID): str,
@@ -50,17 +55,37 @@ SERVICE_IMPORT_HISTORICAL_DATA_SCHEMA = vol.Schema(
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Initialize scheduling state and register the Linky action."""
+    """Initialize scheduling state and register the Linky actions."""
     try:
         await async_get_conso_budget(hass).async_initialize()
     except ConsoBudgetError as err:
         _LOGGER.error("Could not initialize the Linky request budget: %s", err)
 
-    async def handle_import_historical_data(call: ServiceCall) -> None:
-        """Import statistics for the selected loaded meter."""
+    def get_loaded_entry(call: ServiceCall) -> LinkyConfigEntry:
         entry = hass.config_entries.async_get_entry(call.data[ATTR_CONFIG_ENTRY_ID])
         if entry is None or entry.domain != DOMAIN or entry.state is not ConfigEntryState.LOADED:
             raise ServiceValidationError("Select a loaded Linky meter")
+        return entry
+
+    async def run_entry_action[T](
+        entry: LinkyConfigEntry, action: str, operation: Coroutine[Any, Any, T]
+    ) -> T:
+        task = entry.async_create_background_task(hass, operation, f"Linky {action}")
+        try:
+            return await task
+        except ConfigEntryAuthFailed:
+            entry.async_start_reauth(hass)
+            raise
+        except asyncio.CancelledError:
+            if entry.state is not ConfigEntryState.LOADED:
+                raise ServiceValidationError(
+                    f"The Linky meter was unloaded during {action}"
+                ) from None
+            raise
+
+    async def handle_import_historical_data(call: ServiceCall) -> None:
+        """Import statistics for the selected loaded meter."""
+        entry = get_loaded_entry(call)
 
         today = dt_util.now(PARIS_TZ).date()
         start = call.data[ATTR_START_DATE]
@@ -71,18 +96,18 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         if end > today:
             raise ServiceValidationError("End date cannot be after today in Paris")
 
-        task = entry.async_create_background_task(
-            hass, entry.runtime_data.import_statistics(start, end), "Import Linky statistics"
-        )
-        try:
-            await task
-        except ConfigEntryAuthFailed:
-            entry.async_start_reauth(hass)
-            raise
-        except asyncio.CancelledError:
-            if entry.state is not ConfigEntryState.LOADED:
-                raise ServiceValidationError("The Linky meter was unloaded during import") from None
-            raise
+        await run_entry_action(entry, "import", entry.runtime_data.import_statistics(start, end))
+
+    async def handle_refresh(call: ServiceCall) -> ServiceResponse | None:
+        """Run the same daily refresh as the scheduler."""
+        entry = get_loaded_entry(call)
+        result = await run_entry_action(entry, "refresh", entry.runtime_data.async_refresh_now())
+        return result if call.return_response else None
+
+    async def handle_get_status(call: ServiceCall) -> ServiceResponse:
+        """Read local collection status without contacting Conso."""
+        entry = get_loaded_entry(call)
+        return await run_entry_action(entry, "status check", entry.runtime_data.async_get_status())
 
     async_register_admin_service(
         hass,
@@ -90,6 +115,22 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         SERVICE_IMPORT_HISTORICAL_DATA,
         handle_import_historical_data,
         schema=SERVICE_IMPORT_HISTORICAL_DATA_SCHEMA,
+    )
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_REFRESH,
+        handle_refresh,
+        schema=METER_ACTION_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_GET_STATUS,
+        handle_get_status,
+        schema=METER_ACTION_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
     )
     return True
 

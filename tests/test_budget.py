@@ -11,6 +11,7 @@ from homeassistant.helpers import storage
 
 from custom_components.linky import budget as budget_module
 from custom_components.linky.budget import (
+    DAILY_ATTEMPT_USED,
     ConsoBudgetError,
     ConsoBudgetExceeded,
     async_get_conso_budget,
@@ -168,6 +169,40 @@ async def test_two_slot_batch_reports_when_second_oldest_attempt_expires(ready, 
         assert claimed
 
 
+async def test_status_reports_rolling_capacity_and_the_next_paris_day(ready):
+    _, budget = ready
+    midnight = datetime(2026, 10, 25, tzinfo=PARIS_TZ)
+    with freeze_time(midnight, real_asyncio=True):
+        day = midnight.date()
+        assert await budget.async_get_status(_PRM, required=2) == {
+            "requests_remaining": 3,
+            "last_daily_attempt": None,
+            "can_refresh": True,
+            "blocking_reason": None,
+            "retry_in_seconds": None,
+        }
+        assert await _claim(budget, _PRM, day, required=2)
+        status = await budget.async_get_status(_PRM, required=2)
+        assert status["last_daily_attempt"] == day.isoformat()
+        assert not status["can_refresh"]
+        assert status["blocking_reason"] == DAILY_ATTEMPT_USED
+        assert status["retry_in_seconds"] == 25 * 3600
+
+        await _admit(budget)
+        await _admit(budget)
+        status = await budget.async_get_status(_PRM, required=2)
+        assert status["requests_remaining"] == 1
+        assert "limit reached" in status["blocking_reason"]
+        assert status["retry_in_seconds"] == 25 * 3600
+
+        async with budget.request(_PRM) as mark_cooldown:
+            mark_cooldown(2 * _WINDOW)
+        status = await budget.async_get_status(_PRM, required=2)
+        assert status["requests_remaining"] == 0
+        assert "paused" in status["blocking_reason"]
+        assert status["retry_in_seconds"] == 2 * _WINDOW
+
+
 async def test_limit_rolls_across_paris_midnight_dst_and_restart(tmp_path, clock, ready):
     _, budget = ready
     async with budget.request(_PRM):
@@ -233,6 +268,8 @@ async def test_uptime_reset_pauses_all_requests_and_carries_cooldown(
     # For changed IDs, even a larger uptime belongs to a different monotonic timeline.
     clock.elapsed = 1.0 if reset == "regression" else 10.0 * _WINDOW
     reopened = async_get_conso_budget(HomeAssistant(str(tmp_path)))
+    with pytest.raises(ConsoBudgetError, match="not initialized for this boot"):
+        await reopened.async_get_status(_PRM, required=1)
     await reopened.async_initialize()
     assert not await _claim(reopened, _PRM, _DAY)
     with pytest.raises(ConsoBudgetExceeded, match="budget initialization"):
@@ -347,6 +384,12 @@ async def test_failed_cooldown_write_preserves_the_error_and_blocks_on_restart(
             raise ValueError("original provider error")
 
     reopened = async_get_conso_budget(HomeAssistant(str(tmp_path)))
+    status = await reopened.async_get_status(_PRM, required=1)
+    assert status["last_daily_attempt"] is None
+    assert not status["can_refresh"]
+    assert status["requests_remaining"] == 2
+    assert status["retry_in_seconds"] is None
+    clock.elapsed += 17  # The read did not start the pending request's cooldown.
     with pytest.raises(ConsoBudgetExceeded, match="paused") as error:
         await _admit(reopened)
     assert error.value.retry_in == _WINDOW

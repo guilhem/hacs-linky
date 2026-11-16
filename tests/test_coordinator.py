@@ -228,6 +228,55 @@ async def test_generic_refreshes_share_one_daily_attempt(
     assert notify.call_count == notification_count + 1
 
 
+async def test_manual_refreshes_report_their_own_outcome(
+    hass: HomeAssistant, client: MagicMock, write_statistics: AsyncMock
+) -> None:
+    """Two concurrent calls use one daily batch and return different outcomes."""
+    coordinator = LinkyDataUpdateCoordinator(hass, client, collect_export=False)
+    client.get_consumption_load_curve.side_effect = _curve
+
+    first, second = await asyncio.gather(
+        coordinator.async_refresh_now(), coordinator.async_refresh_now()
+    )
+
+    assert first == {"status": "updated"}
+    assert second["status"] == "skipped"
+    assert "already been attempted" in second["reason"]
+    client.get_consumption_load_curve.assert_awaited_once()
+    write_statistics.assert_awaited_once()
+
+
+@pytest.mark.parametrize("outcome", ["no_data", "partial", "provider_failed", "recorder_failed"])
+async def test_manual_refresh_reports_data_and_failures(
+    hass: HomeAssistant, client: MagicMock, write_statistics: AsyncMock, outcome: str
+) -> None:
+    coordinator = LinkyDataUpdateCoordinator(hass, client, collect_export=True)
+    if outcome == "no_data":
+        assert await coordinator.async_refresh_now() == {"status": "no_data"}
+        write_statistics.assert_not_awaited()
+    elif outcome == "partial":
+        client.get_consumption_load_curve.side_effect = _curve
+        client.get_production_load_curve.side_effect = APIError("HTTP 503", 503)
+        result = await coordinator.async_refresh_now()
+        assert result["status"] == "partial"
+        assert "HTTP 503" in result["reason"]
+        write_statistics.assert_awaited_once()
+    elif outcome == "provider_failed":
+        client.get_consumption_load_curve.side_effect = APIError("HTTP 503", 503)
+        with pytest.raises(HomeAssistantError, match="HTTP 503"):
+            await coordinator.async_refresh_now()
+        assert not coordinator.last_update_success
+        write_statistics.assert_not_awaited()
+    else:
+        client.get_consumption_load_curve.side_effect = _curve
+        write_statistics.side_effect = HomeAssistantError("Recorder failed")
+        with pytest.raises(HomeAssistantError, match="Check the Recorder logs"):
+            await coordinator.async_refresh_now()
+        write_statistics.assert_awaited_once()
+
+    assert (await coordinator.async_refresh_now())["status"] == "skipped"
+
+
 async def test_export_defers_until_the_batch_fits_in_the_rolling_budget(
     hass: HomeAssistant,
     client: MagicMock,
@@ -251,7 +300,11 @@ async def test_export_defers_until_the_batch_fits_in_the_rolling_budget(
         freeze_time("2026-11-16 08:00:00", real_asyncio=True),
         patch("custom_components.linky.coordinator.async_call_later") as call_later,
     ):
-        await coordinator.async_refresh()
+        assert (await coordinator.async_get_status())["retry_in_seconds"] == 12
+        result = await coordinator.async_refresh_now()
+        assert result["status"] == "skipped"
+        assert "limit reached" in result["reason"]
+        assert result["retry_in_seconds"] == 12
         client.get_consumption_load_curve.assert_not_awaited()
         client.get_production_load_curve.assert_not_awaited()
         call_later.assert_called_once()
@@ -506,7 +559,8 @@ async def test_refresh_only_reauthenticates_for_real_auth_errors(
         reauth.assert_not_called()
 
         client.get_consumption_load_curve.side_effect = AuthenticationError("Token rejected", 401)
-        await coordinator.async_refresh()
+        with pytest.raises(HomeAssistantError, match="Reauthenticate the meter"):
+            await coordinator.async_refresh_now()
         assert isinstance(coordinator.last_exception, ConfigEntryAuthFailed)
         reauth.assert_called_once_with(hass)
     write_statistics.assert_not_awaited()

@@ -10,8 +10,13 @@ from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE, Conf
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError, Unauthorized
+from homeassistant.helpers.service import async_get_all_descriptions
 
-from custom_components.linky import SERVICE_IMPORT_HISTORICAL_DATA
+from custom_components.linky import (
+    SERVICE_GET_STATUS,
+    SERVICE_IMPORT_HISTORICAL_DATA,
+    SERVICE_REFRESH,
+)
 from custom_components.linky.api import AuthenticationError
 from custom_components.linky.const import CONF_COLLECT_EXPORT, CONF_DAILY_ONLY, DOMAIN
 
@@ -30,7 +35,11 @@ async def test_setup_entry(
 
     assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
     assert mock_config_entry.state is ConfigEntryState.NOT_LOADED
-    assert hass.services.has_service(DOMAIN, SERVICE_IMPORT_HISTORICAL_DATA)
+    descriptions = (await async_get_all_descriptions(hass))[DOMAIN]
+    for action in (SERVICE_IMPORT_HISTORICAL_DATA, SERVICE_REFRESH, SERVICE_GET_STATUS):
+        assert descriptions[action]["fields"]["config_entry_id"]["selector"] == {
+            "config_entry": {"integration": DOMAIN}
+        }
     mock_http_session.close.assert_not_called()
 
 
@@ -106,11 +115,27 @@ async def test_refresh_import_and_reconfigure_share_one_request_budget(
             blocking=True,
         )
 
+    async def run_action(action: str) -> dict:
+        return await hass.services.async_call(
+            DOMAIN, action, {"config_entry_id": entry.entry_id}, blocking=True, return_response=True
+        )
+
     with freeze_time("2026-01-03 10:00:00", real_asyncio=True):
         assert await hass.config_entries.async_setup(entry.entry_id)
+        status = await run_action(SERVICE_GET_STATUS)
+        assert status["can_refresh"] is True
+        assert status["requests_remaining"] == 3
         mock_http_session.get.assert_not_called()
+
+        assert (await run_action(SERVICE_REFRESH))["status"] == "updated"
         await entry.runtime_data.async_refresh()
-        await entry.runtime_data.async_refresh()
+        assert (await run_action(SERVICE_REFRESH))["status"] == "skipped"
+        status = await run_action(SERVICE_GET_STATUS)
+        assert status["can_refresh"] is False
+        assert status["last_daily_attempt"] == "2026-01-03"
+        assert status["requests_remaining"] == 2
+        assert status["blocking_reason"]
+        assert single_prm_token not in str(status)
         mock_http_session.get.assert_called_once()
 
         await import_day()
@@ -129,7 +154,33 @@ async def test_refresh_import_and_reconfigure_share_one_request_budget(
 
         with pytest.raises(HomeAssistantError, match="(?i)budget|limit"):
             await import_day()
+        assert (await run_action(SERVICE_GET_STATUS))["requests_remaining"] == 0
         assert mock_http_session.get.call_count == 3
+
+
+@pytest.mark.parametrize("service", [SERVICE_REFRESH, SERVICE_GET_STATUS])
+async def test_meter_actions_require_admin_and_a_loaded_entry(
+    hass: HomeAssistant, hass_read_only_user, mock_linky_client, mock_config_entry, service
+) -> None:
+    entry_id = mock_config_entry.entry_id
+    assert await hass.config_entries.async_setup(entry_id)
+
+    async def call(context: Context | None = None) -> None:
+        await hass.services.async_call(
+            DOMAIN,
+            service,
+            {"config_entry_id": entry_id},
+            blocking=True,
+            return_response=True,
+            context=context,
+        )
+
+    with pytest.raises(Unauthorized):
+        await call(Context(user_id=hass_read_only_user.id))
+    assert await hass.config_entries.async_unload(entry_id)
+    with pytest.raises(ServiceValidationError, match="Select a loaded Linky meter"):
+        await call()
+    mock_linky_client.get_consumption_load_curve.assert_not_awaited()
 
 
 async def test_import_targets_selected_loaded_meter(
@@ -212,28 +263,42 @@ async def test_import_dates_permissions_and_failure(
             await call(data)
 
 
-async def test_unload_interrupts_import(
-    hass: HomeAssistant, mock_linky_client, mock_config_entry
+@pytest.mark.parametrize(
+    ("service", "method", "action", "fields"),
+    [
+        (
+            SERVICE_IMPORT_HISTORICAL_DATA,
+            "import_statistics",
+            "import",
+            {"start_date": "2026-01-02"},
+        ),
+        (SERVICE_REFRESH, "async_refresh_now", "refresh", {}),
+        (SERVICE_GET_STATUS, "async_get_status", "status check", {}),
+    ],
+)
+async def test_unload_interrupts_meter_actions(
+    hass: HomeAssistant, mock_linky_client, mock_config_entry, service, method, action, fields
 ) -> None:
-    """Do not let an import keep running with the unloaded entry's coordinator."""
+    """Do not let a service keep using the unloaded entry's coordinator."""
     assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     started = asyncio.Event()
 
-    async def pending_import(start: date, end: date) -> None:
+    async def pending_action(*args) -> None:
         started.set()
         await asyncio.Future()
 
-    with patch.object(mock_config_entry.runtime_data, "import_statistics", pending_import):
-        action = asyncio.create_task(
+    with patch.object(mock_config_entry.runtime_data, method, pending_action):
+        call = asyncio.create_task(
             hass.services.async_call(
                 DOMAIN,
-                SERVICE_IMPORT_HISTORICAL_DATA,
-                {"config_entry_id": mock_config_entry.entry_id, "start_date": "2026-01-02"},
+                service,
+                {"config_entry_id": mock_config_entry.entry_id} | fields,
                 blocking=True,
+                return_response=service == SERVICE_GET_STATUS,
             )
         )
         async with asyncio.timeout(5):
             await started.wait()
         assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
-        with pytest.raises(ServiceValidationError, match="unloaded during import"):
-            await action
+        with pytest.raises(ServiceValidationError, match=f"unloaded during {action}"):
+            await call
