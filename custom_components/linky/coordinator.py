@@ -264,7 +264,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData | None]):
                 async with budget.daily_batch(
                     self.client.prm, end, required=2 if self._collect_export else 1
                 ) as claimed:
-                    if not claimed:
+                    if not claimed or dt_util.now(PARIS_TZ).date() != end:
                         return self._skip_update()
                     self._async_cancel_deferred()
                     data, series, errors = await self._async_fetch_window(end - _MAX_WINDOW, end)

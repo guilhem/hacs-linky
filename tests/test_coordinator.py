@@ -266,6 +266,32 @@ async def test_export_defers_until_the_batch_fits_in_the_rolling_budget(
         write_statistics.assert_awaited_once()
 
 
+async def test_queued_refresh_does_not_start_after_paris_midnight(
+    hass: HomeAssistant, client: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A different meter can still hold the transport when the Paris date changes."""
+    now = datetime(2026, 11, 16, 23, 59, tzinfo=PARIS_TZ)
+    started = asyncio.Event()
+
+    def local_time(_timezone):
+        started.set()
+        return now
+
+    monkeypatch.setattr(
+        "custom_components.linky.coordinator.dt_util", SimpleNamespace(now=local_time)
+    )
+    coordinator = LinkyDataUpdateCoordinator(hass, client, collect_export=False)
+    budget = async_get_conso_budget(hass)
+
+    async with budget.request("98765432109876"):
+        refresh = asyncio.create_task(coordinator.async_refresh())
+        await started.wait()
+        now += timedelta(minutes=1)
+    await refresh
+
+    client.get_consumption_load_curve.assert_not_awaited()
+
+
 async def test_slot_skips_startup_and_disabled_polling(
     hass: HomeAssistant, client: MagicMock, mock_config_entry: ConfigEntry
 ) -> None:
