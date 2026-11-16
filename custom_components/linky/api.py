@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
-from asyncio import sleep
+from asyncio import IncompleteReadError, sleep, timeout
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from json import loads
 from math import isfinite
 from typing import Any
 
@@ -17,7 +19,11 @@ from .const import API_REQUEST_DELAY, PARIS_TZ, USER_AGENT
 
 _BASE_URL = "https://conso.boris.sh/api"
 _TIMEOUT = ClientTimeout(total=20)
+_ERROR_BODY_LIMIT = 8 * 1024
+_ERROR_BODY_TIMEOUT = 1
 _ENEDIS_ERROR = "The Enedis API returned an error"
+_ENEDIS_CODE = re.compile(r"(?:ADAM-ERR|ADAM-DC-)[0-9]{4}|no_data_found")
+_CF_RAY = re.compile(r"[0-9a-f]{16}-[A-Z]{3}")
 _PRM = re.compile(r"[0-9]{14}")
 _JWT = re.compile(r"(?:[A-Za-z0-9_-]+\.){2}[A-Za-z0-9_-]+")
 _MINUTES = re.compile(r"PT([1-9][0-9]?)M")
@@ -178,26 +184,62 @@ def _parse_data(payload: Any, prm: str, business: str, physical: str, unit: str)
 
 async def _check_status(response: ClientResponse) -> None:
     status = response.status
+    message = "Conso API request failed"
+    diagnostic = f"HTTP {status}"
+    if response.headers.get("cf-mitigated") == "challenge":
+        diagnostic += "; Cloudflare challenge"
+        ray = response.headers.get("cf-ray", "")
+        if _CF_RAY.fullmatch(ray) and not _PRM.search(ray):
+            diagnostic += f"; Ray ID: {ray}"
+        raise APIError(f"{message} ({diagnostic})", status)
     if status == 200:
         return
-    if status in (400, 401, 404):
+
+    body = None
+    content_type = response.content_type
+    if content_type == "application/json" or (
+        content_type.startswith("application/") and content_type.endswith("+json")
+    ):
         try:
-            body = await response.json()
-        except ContentTypeError, ValueError:
-            body = None
-        upstream = isinstance(body, dict) and body.get("message") == _ENEDIS_ERROR
-        if status == 401 and not upstream:
-            raise AuthenticationError("Conso API denied access to this meter", status)
-        if upstream and isinstance(detail := body.get("error"), dict):
-            code = detail.get("error")
-            if status == 400 and code in ("ADAM-ERR0123", "ADAM-ERR0125"):
-                raise HistoryLimitError("Requested data predates available meter history", status)
-            if status == 404 and (
-                code in ("Not Found", "no_data_found")
-                or detail.get("message") == "Pas de mesure trouvée pour ce point"
-            ):
-                raise NoDataError("Enedis returned no measurements", status)
-    raise APIError(f"Conso API request failed (HTTP {status})", status)
+            async with timeout(_ERROR_BODY_TIMEOUT):
+                await response.content.readexactly(_ERROR_BODY_LIMIT + 1)
+        except IncompleteReadError as err:
+            with suppress(ValueError, RecursionError):
+                body = loads(err.partial)
+        except ClientError, OSError:
+            raise APIError(f"{message} ({diagnostic})", status) from None
+        else:
+            raise APIError(f"{message} ({diagnostic})", status)
+
+    upstream = isinstance(body, dict) and body.get("message") == _ENEDIS_ERROR
+    detail = body.get("error") if upstream else None
+    code = detail.get("error") if isinstance(detail, dict) else None
+    error_type = APIError
+    if status == 401 and not upstream:
+        error_type, message = AuthenticationError, "Conso API denied access to this meter"
+    elif status == 400 and code in ("ADAM-ERR0123", "ADAM-ERR0125"):
+        error_type, message = HistoryLimitError, "Requested data predates available meter history"
+    elif (
+        status == 404
+        and isinstance(detail, dict)
+        and (
+            code in ("Not Found", "no_data_found")
+            or detail.get("message") == "Pas de mesure trouvée pour ce point"
+        )
+    ):
+        error_type, message = NoDataError, "Enedis returned no measurements"
+
+    if (
+        upstream
+        and type(body.get("status")) is int
+        and body["status"] == status
+        and isinstance(detail, (dict, str))
+    ):
+        diagnostic += "; Enedis"
+        if isinstance(code, str) and _ENEDIS_CODE.fullmatch(code):
+            diagnostic += f": {code}"
+
+    raise error_type(f"{message} ({diagnostic})", status)
 
 
 class LinkyClient:

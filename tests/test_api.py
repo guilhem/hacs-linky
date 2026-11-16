@@ -1,11 +1,14 @@
 """Exercise the Conso V2 adapter without contacting the service."""
 
+from asyncio import Event, wait_for
 from datetime import UTC, date, datetime, timedelta
+from json import dumps
 from unittest.mock import AsyncMock, MagicMock, call
 
 import jwt
 import pytest
-from aiohttp import ClientConnectionError, ClientSession
+from aiohttp import ClientConnectionError, ClientPayloadError, ClientSession, StreamReader
+from multidict import CIMultiDict
 
 from custom_components.linky.api import (
     APIError,
@@ -38,8 +41,17 @@ def http():
     session = MagicMock(spec=ClientSession)
     response = session.get.return_value.__aenter__.return_value
     response.status = 200
+    response.headers = CIMultiDict()
+    response.content_type = "application/json"
+    response.content.readexactly = AsyncMock()
     response.json = AsyncMock()
     return session, response
+
+
+def _error_body(response, payload: bytes):
+    response.content = StreamReader(MagicMock(), limit=65536)
+    response.content.feed_data(payload)
+    response.content.feed_eof()
 
 
 def _payload(business, physical, unit, *points, **extras):
@@ -219,6 +231,15 @@ def test_rejects_malformed_token_or_subject(http, token):
             NoDataError,
         ),
         (404, {"message": "Unknown route"}, APIError),
+        (
+            404,
+            {
+                "status": 404,
+                "message": "The Enedis API returned an error",
+                "error": {"message": "Pas de mesure trouvée pour ce point"},
+            },
+            NoDataError,
+        ),
         (403, {"message": "Cloudflare block"}, APIError),
         (429, {"message": "Rate limited"}, APIError),
         (500, {"message": "Service failure"}, APIError),
@@ -230,7 +251,7 @@ async def test_error_statuses_are_classified_without_exposing_response(
     session, response = http
     token = _token([_PRM])
     response.status = status
-    response.json.return_value = {**body, "private": f"{_PRM} {token} private data"}
+    _error_body(response, dumps({**body, "private": f"{_PRM} {token} private data"}).encode())
 
     with pytest.raises(error_type) as error:
         await LinkyClient(session, token).get_daily_consumption(_START, _END)
@@ -238,6 +259,210 @@ async def test_error_statuses_are_classified_without_exposing_response(
     assert type(error.value) is error_type
     assert error.value.status_code == status
     assert not any(s in str(error.value) for s in (_PRM, token, "private data"))
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("ADAM-ERR0123", "; Enedis: ADAM-ERR0123"),
+        ("ADAM-DC-0007", "; Enedis: ADAM-DC-0007"),
+        ("no_data_found", "; Enedis: no_data_found"),
+        ("ADAM-ERR0123\nprivate data", "; Enedis"),
+        (_PRM, "; Enedis"),
+        (["ADAM-ERR0123"], "; Enedis"),
+    ],
+)
+async def test_wrapped_403_preserves_only_safe_enedis_diagnostics(http, code, expected):
+    session, response = http
+    token = _token([_PRM])
+    response.status = 403
+    response.headers["X-Request-ID"] = token
+    body = {
+        "status": 403,
+        "message": "The Enedis API returned an error",
+        "error": {
+            "error": code,
+            "error_description": f"<p>private data https://example.test/{_PRM} {token}</p>",
+            "correlationId": token,
+        },
+    }
+    _error_body(response, dumps(body).encode())
+
+    with pytest.raises(APIError) as error:
+        await LinkyClient(session, token).get_daily_consumption(_START, _END)
+
+    assert type(error.value) is APIError
+    assert error.value.status_code == 403
+    assert str(error.value) == f"Conso API request failed (HTTP 403{expected})"
+
+
+async def test_enedis_wrapper_can_carry_raw_text_without_exposing_it(http):
+    session, response = http
+    token = _token([_PRM])
+    response.status = 502
+    body = {
+        "status": 502,
+        "message": "The Enedis API returned an error",
+        "error": f"<html>Cloudflare https://example.test/{_PRM} {token}</html>",
+    }
+    _error_body(response, dumps(body).encode())
+
+    with pytest.raises(APIError) as error:
+        await LinkyClient(session, token).get_daily_consumption(_START, _END)
+
+    assert error.value.status_code == 502
+    assert str(error.value) == "Conso API request failed (HTTP 502; Enedis)"
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        (
+            {"CF-Mitigated": "challenge", "CF-Ray": "230b030023ae2822-SJC"},
+            "; Cloudflare challenge; Ray ID: 230b030023ae2822-SJC",
+        ),
+        ({"CF-Mitigated": "challenge", "CF-Ray": f"{_PRM}ab-SJC"}, "; Cloudflare challenge"),
+        (
+            {"CF-Mitigated": "challenge", "CF-Ray": "https://example.test/"},
+            "; Cloudflare challenge",
+        ),
+        ({"Server": "cloudflare", "CF-Ray": "230b030023ae2822-SJC"}, ""),
+        ({"CF-Mitigated": "other"}, ""),
+        ({}, ""),
+    ],
+)
+async def test_non_json_403_requires_explicit_challenge_marker(http, headers, expected):
+    session, response = http
+    response.status = 403
+    response.headers.update(headers)
+    response.content_type = "text/html"
+
+    with pytest.raises(APIError) as error:
+        await LinkyClient(session, _token([_PRM])).get_daily_consumption(_START, _END)
+
+    assert type(error.value) is APIError
+    assert error.value.status_code == 403
+    assert str(error.value) == f"Conso API request failed (HTTP 403{expected})"
+    response.json.assert_not_awaited()
+    response.content.readexactly.assert_not_awaited()
+
+
+@pytest.mark.parametrize("status", [200, 401, 404])
+async def test_explicit_challenge_takes_precedence_over_status_and_body(http, status):
+    session, response = http
+    response.status = status
+    response.headers["cf-mitigated"] = "challenge"
+
+    with pytest.raises(APIError) as error:
+        await LinkyClient(session, _token([_PRM])).get_daily_consumption(_START, _END)
+
+    assert type(error.value) is APIError
+    assert error.value.status_code == status
+    assert str(error.value) == f"Conso API request failed (HTTP {status}; Cloudflare challenge)"
+    response.json.assert_not_awaited()
+    response.content.readexactly.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"message": "Cloudflare block"},
+        {"message": "The Enedis API returned an error", "error": {"error": "ADAM-ERR0123"}},
+        {"status": 401, "message": "The Enedis API returned an error", "error": {}},
+        {"status": 403.0, "message": "The Enedis API returned an error", "error": {}},
+        {"status": 403, "message": "The Enedis API returned an error"},
+        ["The Enedis API returned an error", "ADAM-ERR0123"],
+    ],
+)
+async def test_unrecognized_403_has_neutral_origin(http, body):
+    session, response = http
+    response.status = 403
+    _error_body(response, dumps(body).encode())
+
+    with pytest.raises(APIError) as error:
+        await LinkyClient(session, _token([_PRM])).get_daily_consumption(_START, _END)
+
+    assert type(error.value) is APIError
+    assert error.value.status_code == 403
+    assert str(error.value) == "Conso API request failed (HTTP 403)"
+
+
+async def test_html_429_does_not_read_the_body(http):
+    session, response = http
+    response.status = 429
+    response.content_type = "text/html"
+
+    with pytest.raises(APIError) as error:
+        await LinkyClient(session, _token([_PRM])).get_daily_consumption(_START, _END)
+
+    assert error.value.status_code == 429
+    assert str(error.value) == "Conso API request failed (HTTP 429)"
+    response.json.assert_not_awaited()
+    response.content.readexactly.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("size", "diagnostic", "unread"),
+    [(8192, "; Enedis: ADAM-DC-0007", b""), (8194, "", b" ")],
+)
+async def test_json_error_diagnostic_has_a_byte_limit(http, size, diagnostic, unread):
+    session, response = http
+    response.status = 403
+    response.content_type = "application/problem+json"
+    body = dumps(
+        {
+            "status": 403,
+            "message": "The Enedis API returned an error",
+            "error": {"error": "ADAM-DC-0007"},
+        }
+    ).encode()
+    _error_body(response, body.ljust(size))
+
+    with pytest.raises(APIError) as error:
+        await LinkyClient(session, _token([_PRM])).get_daily_consumption(_START, _END)
+
+    assert error.value.status_code == 403
+    assert str(error.value) == f"Conso API request failed (HTTP 403{diagnostic})"
+    assert response.content.read_nowait() == unread
+    response.json.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", [b"{private response detail", ClientPayloadError("private")])
+async def test_error_diagnostic_failure_does_not_lose_http_status(http, failure):
+    session, response = http
+    response.status = 403
+    if isinstance(failure, bytes):
+        _error_body(response, failure)
+    else:
+        response.content.readexactly.side_effect = failure
+
+    with pytest.raises(APIError) as error:
+        await LinkyClient(session, _token([_PRM])).get_daily_consumption(_START, _END)
+
+    assert error.value.status_code == 403
+    assert str(error.value) == "Conso API request failed (HTTP 403)"
+    assert error.value.__context__ is None or error.value.__suppress_context__
+    response.json.assert_not_awaited()
+
+
+async def test_incomplete_json_is_abandoned_at_the_diagnostic_deadline(http):
+    session, response = http
+    response.status = 500
+    blocked = Event()
+
+    async def slow_read(_: int) -> bytes:
+        await blocked.wait()
+        return b""
+
+    response.content.readexactly.side_effect = slow_read
+    client = LinkyClient(session, _token([_PRM]))
+    with pytest.raises(APIError) as error:
+        await wait_for(client.get_daily_consumption(_START, _END), 2)
+
+    assert error.value.status_code == 500
+    assert str(error.value) == "Conso API request failed (HTTP 500)"
+    response.content.readexactly.assert_awaited_once_with(8193)
+    response.json.assert_not_awaited()
 
 
 @pytest.mark.parametrize("network_error", [ClientConnectionError, TimeoutError])
@@ -310,7 +535,7 @@ async def test_history_limit_requires_enedis_400_and_known_code(
 ):
     session, response = http
     response.status = status
-    response.json.return_value = {
+    body = {
         "status": status,
         "message": "The Enedis API returned an error" if upstream else "Invalid parameters",
         "error": {
@@ -318,6 +543,7 @@ async def test_history_limit_requires_enedis_400_and_known_code(
             "error_description": "Private provider detail",
         },
     }
+    _error_body(response, dumps(body).encode())
     start = _END - timedelta(days=7)
 
     # A manual request must fail with the original bounds rather than truncate history.

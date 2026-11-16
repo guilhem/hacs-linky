@@ -1,5 +1,7 @@
 """Tests for the Linky config and reauthentication flows."""
 
+import json
+from asyncio import IncompleteReadError
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,6 +14,18 @@ from homeassistant.data_entry_flow import FlowResultType
 
 from custom_components.linky.api import PRMAccessError
 from custom_components.linky.const import CONF_PRM, DOMAIN
+
+
+def _mock_error_reply(reply: MagicMock, status: int, body: dict | None) -> None:
+    """Model the content type and end of an HTTP error response."""
+    reply.status = status
+    reply.headers = {}
+    reply.content_type = "application/json" if body is not None else "text/plain"
+    payload = json.dumps(body).encode() if body is not None else b""
+    reply.content_length = len(payload)
+    reply.content.readexactly = AsyncMock(
+        side_effect=IncompleteReadError(payload, len(payload) + 1)
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -81,6 +95,17 @@ async def test_form_multi_prm(
         ({"status": 404}, "cannot_connect"),
         (
             {
+                "status": 403,
+                "json": {
+                    "status": 403,
+                    "message": "The Enedis API returned an error",
+                    "error": {"error": "ADAM-ERR0123", "error_description": "private meter detail"},
+                },
+            },
+            "cannot_connect",
+        ),
+        (
+            {
                 "status": 404,
                 "json": {
                     "message": "The Enedis API returned an error",
@@ -90,10 +115,10 @@ async def test_form_multi_prm(
             None,
         ),
     ],
-    ids=["rejected-token", "timeout", "server-error", "unknown-route", "no-readings"],
+    ids=["rejected-token", "timeout", "server-error", "unknown-route", "forbidden", "no-readings"],
 )
 async def test_form_provider_response(
-    hass: HomeAssistant, single_prm_token: str, response, error
+    hass: HomeAssistant, single_prm_token: str, response, error, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Distinguish rejected credentials, outages, and a valid meter without data."""
     session = MagicMock(spec=ClientSession)
@@ -102,8 +127,7 @@ async def test_form_provider_response(
         request.__aenter__.side_effect = response["exc"]
     else:
         reply = request.__aenter__.return_value
-        reply.status = response["status"]
-        reply.json = AsyncMock(return_value=response.get("json"))
+        _mock_error_reply(reply, response["status"], response.get("json"))
 
     with (
         patch(
@@ -133,6 +157,12 @@ async def test_form_provider_response(
     else:
         assert result["type"] is FlowResultType.FORM
         assert result["errors"] == {"base": error}
+
+    if response.get("status") == 403:
+        assert "HTTP 403" in caplog.text
+        assert "ADAM-ERR0123" in caplog.text
+        assert "private meter detail" not in caplog.text
+        assert single_prm_token not in caplog.text
 
 
 async def test_form_invalid_token(hass: HomeAssistant) -> None:
@@ -200,12 +230,14 @@ async def test_newly_activated_meter_can_be_configured(
     """A verified token can be saved before the first full day of meter data."""
     session = MagicMock(spec=ClientSession)
     reply = session.get.return_value.__aenter__.return_value
-    reply.status = 400
-    reply.json = AsyncMock(
-        return_value={
+    _mock_error_reply(
+        reply,
+        400,
+        {
+            "status": 400,
             "message": "The Enedis API returned an error",
             "error": {"error": "ADAM-ERR0123"},
-        }
+        },
     )
     with (
         patch("custom_components.linky.config_flow.async_get_clientsession", return_value=session),
