@@ -18,6 +18,7 @@ from homeassistant.const import CONF_TOKEN
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -40,8 +41,10 @@ from .api import (
     fetch_recent,
 )
 from .const import (
+    CONF_COLLECT_EXPORT,
     CONF_PRM,
     CONF_SCAN_INTERVAL,
+    DEFAULT_COLLECT_EXPORT,
     DEFAULT_SCAN_INTERVAL_HOURS,
     DOMAIN,
     MAX_SCAN_INTERVAL_HOURS,
@@ -66,6 +69,7 @@ class LinkyOptionsFlow(OptionsFlowWithReload):
         current_interval = self.config_entry.options.get(
             CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS
         )
+        collect_export = self.config_entry.options.get(CONF_COLLECT_EXPORT, DEFAULT_COLLECT_EXPORT)
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
@@ -82,6 +86,7 @@ class LinkyOptionsFlow(OptionsFlowWithReload):
                             unit_of_measurement="h",
                         )
                     ),
+                    vol.Required(CONF_COLLECT_EXPORT, default=collect_export): BooleanSelector(),
                 }
             ),
         )
@@ -119,7 +124,10 @@ class LinkyConfigFlow(ConfigFlow, domain=DOMAIN):
             return [], "invalid_token"
         except PRMAccessError:
             return [], "prm_access_denied"
-        except APIError:
+        except APIError as err:
+            _LOGGER.warning("Could not verify access to the Linky meter: %s", err)
+            if err.status_code == 403:
+                return [], "provider_forbidden"
             return [], "cannot_connect"
         except RuntimeError, ValueError:
             _LOGGER.exception("Unexpected error during Linky token validation")
@@ -170,6 +178,14 @@ class LinkyConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Replace the token for the existing meter on request."""
+        return await self._async_replace_token(
+            self._get_reconfigure_entry(), "reconfigure", user_input
+        )
+
     async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:
         """Start reauthentication for the existing meter."""
         return await self.async_step_reauth_confirm()
@@ -178,22 +194,29 @@ class LinkyConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Validate the replacement token against the existing meter and reload."""
-        entry = self._get_reauth_entry()
+        return await self._async_replace_token(
+            self._get_reauth_entry(), "reauth_confirm", user_input
+        )
+
+    async def _async_replace_token(
+        self, entry: ConfigEntry, step_id: str, user_input: dict[str, Any] | None
+    ) -> ConfigFlowResult:
+        prm = entry.data[CONF_PRM]
         errors = {}
         if user_input is not None:
             token = user_input[CONF_TOKEN]
-            _, error = await self._async_check_token(token, entry.data[CONF_PRM])
+            _, error = await self._async_check_token(token, prm)
             if error is None:
                 return self.async_update_reload_and_abort(entry, data_updates={CONF_TOKEN: token})
             errors["base"] = error
 
         return self.async_show_form(
-            step_id="reauth_confirm",
+            step_id=step_id,
             data_schema=TOKEN_SCHEMA,
             errors=errors,
             description_placeholders={
                 "conso_url": "https://conso.boris.sh",
-                "prm": entry.data[CONF_PRM],
+                "prm": prm,
             },
         )
 
@@ -202,5 +225,7 @@ class LinkyConfigFlow(ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(prm)
         self._abort_if_unique_id_configured()
         return self.async_create_entry(
-            title=f"Linky {prm}", data={CONF_TOKEN: token, CONF_PRM: prm}
+            title=f"Linky {prm}",
+            data={CONF_TOKEN: token, CONF_PRM: prm},
+            options={CONF_COLLECT_EXPORT: False},
         )

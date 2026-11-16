@@ -17,8 +17,10 @@ from homeassistant.util import dt as dt_util
 
 from .api import AuthenticationError, LinkyClient, PRMAccessError
 from .const import (
+    CONF_COLLECT_EXPORT,
     CONF_PRM,
     CONF_SCAN_INTERVAL,
+    DEFAULT_COLLECT_EXPORT,
     DEFAULT_SCAN_INTERVAL_HOURS,
     DOMAIN,
     PARIS_TZ,
@@ -99,6 +101,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: LinkyConfigEntry) -> boo
         hass,
         client,
         scan_interval_hours=entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_HOURS),
+        collect_export=entry.options.get(CONF_COLLECT_EXPORT, DEFAULT_COLLECT_EXPORT),
         config_entry=entry,
     )
     await coordinator.async_config_entry_first_refresh()

@@ -8,10 +8,12 @@ PARIS_TZ: Final = ZoneInfo("Europe/Paris")
 USER_AGENT: Final = "github.com/guilhem/hacs-linky"
 
 # Configuration keys
+CONF_COLLECT_EXPORT: Final = "collect_export"
 CONF_PRM: Final = "prm"
 CONF_SCAN_INTERVAL: Final = "scan_interval"
 
 # Default values
+DEFAULT_COLLECT_EXPORT: Final = True
 DEFAULT_SCAN_INTERVAL_HOURS: Final = 12
 MIN_SCAN_INTERVAL_HOURS: Final = 1
 MAX_SCAN_INTERVAL_HOURS: Final = 24

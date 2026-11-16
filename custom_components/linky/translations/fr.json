@@ -15,6 +15,13 @@
           "prm": "Compteur (PRM)"
         }
       },
+      "reconfigure": {
+        "title": "Remplacer le jeton Linky",
+        "description": "Saisissez un nouveau jeton obtenu sur [{conso_url}]({conso_url}) pour le compteur {prm}.",
+        "data": {
+          "token": "Jeton"
+        }
+      },
       "reauth_confirm": {
         "title": "Reconnecter Linky",
         "description": "Saisissez un nouveau jeton obtenu sur [{conso_url}]({conso_url}) pour le compteur {prm}.",
@@ -27,10 +34,12 @@
       "invalid_token": "Le token est invalide ou expiré",
       "prm_access_denied": "Ce token ne permet pas d'accéder à ce compteur",
       "unknown": "Erreur inattendue",
-      "cannot_connect": "Impossible de joindre Conso API. Réessayez plus tard."
+      "cannot_connect": "La requête Conso API a échoué. Consultez le journal de Home Assistant pour connaître le motif.",
+      "provider_forbidden": "Conso API a refusé la requête (HTTP 403). Le jeton saisi n'a pas été enregistré. Si le refus persiste, consultez les journaux de Home Assistant."
     },
     "abort": {
       "already_configured": "Ce compteur est déjà configuré",
+      "reconfigure_successful": "Le jeton du compteur a été mis à jour.",
       "reauth_successful": "Le jeton du compteur a été mis à jour."
     }
   },
@@ -58,9 +67,11 @@
       "init": {
         "title": "Options Linky",
         "data": {
-          "scan_interval": "Intervalle de mise à jour"
+          "scan_interval": "Intervalle de mise à jour",
+          "collect_export": "Collecter les données d’injection"
         },
         "data_description": {
+          "collect_export": "À activer si ce compteur mesure de l’électricité injectée sur le réseau. S’applique aussi à l’import d’historique.",
           "scan_interval": "Fréquence de récupération des données, en heures. Les données Linky arrivent avec un délai de 24 à 48 heures."
         }
       }
@@ -69,7 +80,7 @@
   "services": {
     "import_historical_data": {
       "name": "Importer l’historique",
-      "description": "Importe l’historique de consommation et d’injection du compteur Linky sélectionné.",
+      "description": "Importe l’historique de consommation et, si la collecte est activée, d’injection du compteur sélectionné.",
       "fields": {
         "config_entry_id": {
           "name": "Compteur Linky",
@@ -84,6 +95,12 @@
           "description": "Arrête l’import avant ce jour (exclu). Par défaut : aujourd’hui à Paris."
         }
       }
+    }
+  },
+  "issues": {
+    "conso_forbidden": {
+      "title": "Relève Linky refusée (compteur se terminant par {meter})",
+      "description": "Conso API a renvoyé HTTP 403 lors de deux relèves consécutives de la consommation journalière. Le statut seul ne permet pas d'en connaître la cause. Linky réessaiera à la prochaine relève prévue. Consultez les journaux de Home Assistant pour plus de détails."
     }
   }
 }

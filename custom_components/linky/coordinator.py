@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import TYPE_CHECKING
+from weakref import WeakSet
 
 from homeassistant.core import CoreState, callback
 from homeassistant.exceptions import (
@@ -15,12 +16,19 @@ from homeassistant.exceptions import (
     HomeAssistantError,
     ServiceValidationError,
 )
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from .api import APIError, AuthenticationError, HistoryLimitError, NoDataError, fetch_recent
-from .const import API_REQUEST_DELAY, DEFAULT_SCAN_INTERVAL_HOURS, DOMAIN, PARIS_TZ
+from .const import (
+    API_REQUEST_DELAY,
+    DEFAULT_COLLECT_EXPORT,
+    DEFAULT_SCAN_INTERVAL_HOURS,
+    DOMAIN,
+    PARIS_TZ,
+)
 from .statistics import Buckets, async_write_statistics, daily_energy, hourly_energy, paris_midnight
 
 if TYPE_CHECKING:
@@ -34,6 +42,7 @@ _POLL_DAYS = timedelta(days=7)
 _CURVE_WINDOW = timedelta(days=7)
 _MAX_IMPORT = timedelta(days=30)
 _REQUEST_LOCK = f"{DOMAIN}_request_lock"
+_DAILY_FORBIDDEN_PENDING = f"{DOMAIN}_daily_forbidden_pending"
 _ENERGY = {
     "daily_consumption": ("consumption", "daily"),
     "daily_production": ("production", "daily"),
@@ -62,6 +71,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         client: LinkyClient,
         scan_interval_hours: int = DEFAULT_SCAN_INTERVAL_HOURS,
         *,
+        collect_export: bool = DEFAULT_COLLECT_EXPORT,
         config_entry: ConfigEntry | None = None,
     ) -> None:
         super().__init__(
@@ -72,8 +82,13 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             config_entry=config_entry,
         )
         self.client = client
+        self._collect_export = collect_export
         self._meter_lock = asyncio.Lock()
         self._request_lock = hass.data.setdefault(_REQUEST_LOCK, asyncio.Lock())
+        # Setup retries recreate the coordinator but keep the same config entry.
+        self._daily_forbidden_pending: WeakSet[ConfigEntry] = hass.data.setdefault(
+            _DAILY_FORBIDDEN_PENDING, WeakSet()
+        )
 
     async def _fetch(
         self,
@@ -100,13 +115,40 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 raise ConfigEntryAuthFailed("Linky authentication failed") from err
 
     def _endpoints(self) -> dict[str, Callable[..., Awaitable[MeteringData]]]:
-        return {
+        endpoints = {
             "daily_consumption": self.client.get_daily_consumption,
             "daily_production": self.client.get_daily_production,
             "load_curve": self.client.get_consumption_load_curve,
             "production_load_curve": self.client.get_production_load_curve,
             "max_power": self.client.get_max_power,
         }
+        if not self._collect_export:
+            del endpoints["daily_production"], endpoints["production_load_curve"]
+        return endpoints
+
+    @callback
+    def _async_update_daily_forbidden_issue(self, *, forbidden: bool, usable: bool) -> None:
+        if (entry := self.config_entry) is None:
+            return
+        issue_id = f"conso_forbidden_{entry.entry_id}"
+        if not forbidden:
+            self._daily_forbidden_pending.discard(entry)
+            if usable:
+                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+        elif entry in self._daily_forbidden_pending:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                issue_id,
+                config_entry_id=entry.entry_id,
+                is_fixable=False,
+                is_persistent=True,
+                severity=ir.IssueSeverity.ERROR,
+                translation_key="conso_forbidden",
+                translation_placeholders={"meter": self.client.prm[-4:]},
+            )
+        else:
+            self._daily_forbidden_pending.add(entry)
 
     async def _async_update_data(self) -> LinkyData:
         """Refetch the previous seven Paris days to include late revisions."""
@@ -118,6 +160,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             errors: list[str] = []
             endpoints = self._endpoints()
             for field, endpoint in endpoints.items():
+                forbidden = False
                 try:
                     result = await self._fetch(endpoint, start, end, recent=True)
                     if result is None or not result.interval_reading:
@@ -128,11 +171,17 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                         series[key] = convert(result, start, end)
                     setattr(data, field, result)
                 except APIError as err:
+                    forbidden = err.status_code == 403
                     errors.append(f"{field} ({err})")
                     if err.status_code == 429:
                         break
                 except ValueError as err:
                     errors.append(f"{field} ({err})")
+                finally:
+                    if field == "daily_consumption":
+                        self._async_update_daily_forbidden_issue(
+                            forbidden=forbidden, usable=bool(series.get(_ENERGY[field]))
+                        )
 
             if errors:
                 if not any(getattr(data, field) is not None for field in endpoints):
@@ -185,11 +234,12 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             raise HomeAssistantError("Wait for Home Assistant to finish starting before importing")
 
         async with self._meter_lock:
-            endpoints = self._endpoints()
             series: dict[tuple[str, str], Buckets] = {}
             errors: list[str] = []
             rate_limited = False
-            for field, key in _ENERGY.items():
+            for field, endpoint in self._endpoints().items():
+                if (key := _ENERGY.get(field)) is None:
+                    continue
                 hourly = key[1] == "hourly"
                 convert = hourly_energy if hourly else daily_energy
                 measured: Buckets = {}
@@ -198,7 +248,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 while cursor < end:
                     limit = min(cursor + _CURVE_WINDOW, end) if hourly else end
                     try:
-                        result = await self._fetch(endpoints[field], cursor, limit)
+                        result = await self._fetch(endpoint, cursor, limit)
                         if result is not None and result.interval_reading:
                             saw_readings = True
                             measured.update(convert(result, cursor, limit))

@@ -33,9 +33,21 @@ with Enedis; hourly Energy charts also require access to the load curve.
 4. Open the Linky device page. **Daily consumption** displays the latest
    published day, and its `last_date` attribute tells you when it was measured.
 
-Export sensors are disabled by default. If you feed electricity back into the
-grid, enable them from the meter's entity list. Export measures what crosses
-your meter towards the grid; it does not measure total solar generation.
+## Change a meter's settings
+
+Open **Settings → Devices & services → Linky** and use the meter's menu:
+
+- **Reconfigure** replaces the Conso token for this meter. Home Assistant
+  verifies that the new token works for the same meter before saving it.
+  Your entities, preferences, and Energy history stay in place.
+- **Configure** sets the update interval (12 hours by default) and whether to
+  collect grid export. Export collection is off for newly added meters and
+  stays on for existing meters until you turn it off. Enable it if you send
+  electricity back to the grid. The setting applies to scheduled updates and
+  historical imports. Readings already in Energy are kept.
+
+Export measures electricity sent to the grid. For the latest export readings
+on the device page, also enable the export sensors in the meter's entity list.
 
 ## Add the meter to Energy
 
@@ -64,7 +76,7 @@ An incomplete hour or an ambiguous timestamp at the clock change is left as a ga
 
 | What you see | What to check |
 | --- | --- |
-| Home Assistant asks you to sign in again | Generate a Conso token for the same meter and enter it in the repair prompt. |
+| Your token expired or you generated a replacement | Open the meter’s **Reconfigure** menu. If Home Assistant already opened a repair, you can also enter the new token there. |
 | Daily readings are visible but no hourly series appears | Check that Enedis load curve collection is enabled and that Conso can return interval data. You can use the daily statistic in Energy. |
 | Today's readings are absent | Check the reading date on the sensor. Conso does not publish a live feed. |
 

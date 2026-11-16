@@ -2,9 +2,10 @@
 
 import asyncio
 from datetime import date, timedelta
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.exceptions import (
@@ -12,6 +13,7 @@ from homeassistant.exceptions import (
     HomeAssistantError,
     ServiceValidationError,
 )
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -24,7 +26,7 @@ from custom_components.linky.api import (
     MeteringData,
     NoDataError,
 )
-from custom_components.linky.const import PARIS_TZ
+from custom_components.linky.const import DOMAIN, PARIS_TZ
 from custom_components.linky.coordinator import LinkyData, LinkyDataUpdateCoordinator
 from custom_components.linky.statistics import paris_midnight
 
@@ -65,6 +67,190 @@ async def _daily(start: date, end: date) -> MeteringData:
         end,
         [IntervalReading(start + i * _DAY, 1500) for i in range((end - start).days)],
         "Wh",
+    )
+
+
+async def test_daily_forbidden_repair_lifecycle(
+    hass: HomeAssistant,
+    client: MagicMock,
+    write_statistics: AsyncMock,
+    mock_config_entry: ConfigEntry,
+    max_power_data: MeteringData,
+) -> None:
+    """Alert once on repeated daily 403s, even when max power still refreshes."""
+    coordinator = LinkyDataUpdateCoordinator(hass, client, config_entry=mock_config_entry)
+    registry = ir.async_get(hass)
+    key = (DOMAIN, f"conso_forbidden_{mock_config_entry.entry_id}")
+    client.get_max_power.side_effect = None
+    client.get_max_power.return_value = max_power_data
+    forbidden = APIError("HTTP 403", 403)
+    client.get_daily_production.side_effect = forbidden
+    client.get_production_load_curve.side_effect = forbidden
+
+    for _ in range(2):
+        assert (await coordinator._async_update_data()).max_power == max_power_data
+        assert registry.async_get_issue(*key) is None
+
+    client.get_daily_production.side_effect = NoDataError("No measurements", 404)
+    client.get_production_load_curve.side_effect = NoDataError("No measurements", 404)
+    daily = client.get_daily_consumption
+    daily.side_effect = forbidden
+    with pytest.raises(HomeAssistantError, match="HTTP 403"):
+        await coordinator.import_statistics(_START, _START + _DAY)
+    assert registry.async_get_issue(*key) is None
+
+    assert (await coordinator._async_update_data()).max_power == max_power_data
+    assert registry.async_get_issue(*key) is None
+    data = await coordinator._async_update_data()
+    assert data.daily_consumption is None
+    assert data.max_power == max_power_data
+    issue = registry.async_get_issue(*key)
+    assert issue is not None and issue.active
+    assert issue.config_entry_id == mock_config_entry.entry_id
+    assert issue.severity is ir.IssueSeverity.ERROR
+    assert issue.is_fixable is False
+    assert issue.data is None
+    assert issue.translation_key == "conso_forbidden"
+    assert issue.translation_placeholders == {"meter": "1234"}
+
+    await coordinator._async_update_data()
+    assert registry.async_get_issue(*key) is issue
+
+    await registry._store.async_save(registry._data_to_save())
+    reloaded_registry = ir.IssueRegistry(hass)
+    # The test fixture creates ConfigEntries without bootstrapping their storage.
+    with patch.object(hass.config_entries, "async_wait_initialized", new_callable=AsyncMock):
+        await reloaded_registry.async_load()
+    reloaded_issue = reloaded_registry.async_get_issue(*key)
+    assert reloaded_issue is not None and reloaded_issue.active
+
+    daily.side_effect = _daily
+    await coordinator.import_statistics(_START, _START + _DAY)
+    assert registry.async_get_issue(*key) is issue
+    await coordinator._async_update_data()
+    assert registry.async_get_issue(*key) is None
+
+    daily.side_effect = forbidden
+    await coordinator._async_update_data()
+    assert registry.async_get_issue(*key) is None
+    await coordinator._async_update_data()
+    assert registry.async_get_issue(*key) is not None
+
+
+async def test_daily_forbidden_repair_requires_consecutive_failures_and_usable_recovery(
+    hass: HomeAssistant,
+    client: MagicMock,
+    write_statistics: AsyncMock,
+    mock_config_entry: ConfigEntry,
+    max_power_data: MeteringData,
+) -> None:
+    """Missing data, timeouts, and unusable readings reset the streak without clearing an issue."""
+    coordinator = LinkyDataUpdateCoordinator(hass, client, config_entry=mock_config_entry)
+    registry = ir.async_get(hass)
+    key = (DOMAIN, f"conso_forbidden_{mock_config_entry.entry_id}")
+    client.get_max_power.side_effect = None
+    client.get_max_power.return_value = max_power_data
+    daily = client.get_daily_consumption
+
+    async def invalid_daily(start: date, end: date) -> MeteringData:
+        return MeteringData(_PRM, start, end, [IntervalReading(start, -1)], "Wh")
+
+    other_outcomes = (
+        NoDataError("No measurements", 404),
+        APIError("Conso API request timed out"),
+        invalid_daily,
+    )
+    forbidden = APIError("HTTP 403", 403)
+    for outcome in other_outcomes:
+        daily.side_effect = forbidden
+        await coordinator._async_update_data()
+        assert registry.async_get_issue(*key) is None
+        daily.side_effect = outcome
+        await coordinator._async_update_data()
+        assert registry.async_get_issue(*key) is None
+
+    daily.side_effect = forbidden
+    await coordinator._async_update_data()
+    assert registry.async_get_issue(*key) is None
+    await coordinator._async_update_data()
+    issue = registry.async_get_issue(*key)
+    assert issue is not None
+    for outcome in other_outcomes:
+        daily.side_effect = outcome
+        await coordinator._async_update_data()
+        assert registry.async_get_issue(*key) is issue
+
+
+async def test_daily_forbidden_repair_survives_setup_retry_and_clears_on_reload(
+    hass: HomeAssistant,
+    mock_linky_client: MagicMock,
+    mock_config_entry: ConfigEntry,
+    write_statistics: AsyncMock,
+) -> None:
+    """Count failed setup attempts across coordinators and clear on the first usable reading."""
+    registry = ir.async_get(hass)
+    entry_id = mock_config_entry.entry_id
+    key = (DOMAIN, f"conso_forbidden_{entry_id}")
+    mock_linky_client.get_daily_consumption.side_effect = APIError("HTTP 403", 403)
+    mock_linky_client.get_consumption_load_curve.return_value = None
+    mock_linky_client.get_max_power.return_value = None
+
+    assert not await hass.config_entries.async_setup(entry_id)
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+    assert registry.async_get_issue(*key) is None
+    assert not await hass.config_entries.async_reload(entry_id)
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+    assert registry.async_get_issue(*key) is not None
+
+    mock_linky_client.get_daily_consumption.side_effect = _daily
+    assert await hass.config_entries.async_reload(entry_id)
+    assert registry.async_get_issue(*key) is None
+
+
+@pytest.mark.parametrize("historical", [False, True], ids=["refresh", "import"])
+async def test_export_disabled(
+    hass: HomeAssistant, client: MagicMock, write_statistics: AsyncMock, historical: bool
+) -> None:
+    """Skip production requests and writes while collecting both consumption series."""
+    end = _START + _DAY if historical else dt_util.now(PARIS_TZ).date()
+    start = _START if historical else end - 7 * _DAY
+    hour = timedelta(hours=1)
+    first_hour = paris_midnight(start)
+    hours = (paris_midnight(end) - first_hour) // hour
+    curve = MeteringData(
+        _PRM,
+        start,
+        end,
+        [IntervalReading(first_hour + (i + 1) * hour, 500, hour) for i in range(hours)],
+        "W",
+    )
+    client.get_daily_consumption.side_effect = _daily
+    client.get_daily_production.side_effect = _daily
+    for endpoint in (client.get_consumption_load_curve, client.get_production_load_curve):
+        endpoint.side_effect = None
+        endpoint.return_value = curve
+    coordinator = LinkyDataUpdateCoordinator(hass, client, collect_export=False)
+
+    if historical:
+        await coordinator.import_statistics(start, end)
+        client.get_max_power.assert_not_awaited()
+    else:
+        data = await coordinator._async_update_data()
+        assert data.daily_production is None
+        assert data.production_load_curve is None
+        client.get_max_power.assert_awaited_once()
+
+    client.get_daily_production.assert_not_awaited()
+    client.get_production_load_curve.assert_not_awaited()
+    write_statistics.assert_awaited_once_with(
+        hass,
+        _PRM,
+        {
+            ("consumption", "daily"): {
+                paris_midnight(start + i * _DAY): 1.5 for i in range((end - start).days)
+            },
+            ("consumption", "hourly"): {first_hour + i * hour: 0.5 for i in range(hours)},
+        },
     )
 
 

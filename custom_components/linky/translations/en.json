@@ -15,6 +15,13 @@
           "prm": "Meter (PRM)"
         }
       },
+      "reconfigure": {
+        "title": "Replace the Linky token",
+        "description": "Enter a new token from [{conso_url}]({conso_url}) for meter {prm}.",
+        "data": {
+          "token": "Token"
+        }
+      },
       "reauth_confirm": {
         "title": "Reconnect Linky",
         "description": "Enter a new token from [{conso_url}]({conso_url}) for meter {prm}.",
@@ -27,10 +34,12 @@
       "invalid_token": "The token is invalid or expired",
       "prm_access_denied": "This token does not grant access to this meter",
       "unknown": "Unexpected error",
-      "cannot_connect": "Could not contact Conso API. Try again later."
+      "cannot_connect": "The Conso API request failed. Check the Home Assistant logs for details.",
+      "provider_forbidden": "Conso API refused the request (HTTP 403). The submitted token was not saved. If it keeps happening, check the Home Assistant logs."
     },
     "abort": {
       "already_configured": "This meter is already configured",
+      "reconfigure_successful": "The token for this meter was updated.",
       "reauth_successful": "The token for this meter was updated."
     }
   },
@@ -39,9 +48,11 @@
       "init": {
         "title": "Linky Options",
         "data": {
-          "scan_interval": "Update interval"
+          "scan_interval": "Update interval",
+          "collect_export": "Collect grid export"
         },
         "data_description": {
+          "collect_export": "Enable if this meter measures electricity sent to the grid. Also applies to historical imports.",
           "scan_interval": "How often to fetch data (in hours). Linky data has a 24-48h delay."
         }
       }
@@ -50,7 +61,7 @@
   "services": {
     "import_historical_data": {
       "name": "Import historical data",
-      "description": "Import historical consumption and export data for the selected Linky meter.",
+      "description": "Import historical consumption and, if collection is enabled, grid export for the selected meter.",
       "fields": {
         "config_entry_id": {
           "name": "Linky meter",
@@ -84,6 +95,12 @@
       "current_production_power": {
         "name": "Latest average export power"
       }
+    }
+  },
+  "issues": {
+    "conso_forbidden": {
+      "title": "Linky refresh refused (meter ending in {meter})",
+      "description": "Conso API returned HTTP 403 on two consecutive daily consumption refreshes. The status alone does not identify the cause. Linky will try again at the next scheduled refresh. Check the Home Assistant logs for details."
     }
   }
 }
