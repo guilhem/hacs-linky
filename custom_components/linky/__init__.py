@@ -27,6 +27,7 @@ from .const import (
 )
 from .coordinator import LinkyDataUpdateCoordinator
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 type LinkyConfigEntry = ConfigEntry[LinkyDataUpdateCoordinator]
