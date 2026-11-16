@@ -103,7 +103,7 @@ async def test_form_multi_prm(
                     "error": {"error": "ADAM-ERR0123", "error_description": "private meter detail"},
                 },
             },
-            "cannot_connect",
+            "provider_forbidden",
         ),
         (
             {
@@ -235,6 +235,16 @@ async def test_reconfigure_token_during_setup_retry(
         assert entry.data == original_data
         reload_entry.assert_not_called()
 
+        _mock_error_reply(reply, 403, None)
+        reply.headers["cf-mitigated"] = "challenge"
+        result = await hass.config_entries.flow.async_configure(
+            flow_id, {CONF_TOKEN: multi_prm_token}
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {"base": "provider_forbidden"}
+        assert entry.data == original_data
+        reload_entry.assert_not_called()
+
         _mock_error_reply(
             reply,
             404,
@@ -251,7 +261,7 @@ async def test_reconfigure_token_during_setup_retry(
     assert entry.unique_id == prm
     assert entry.data == original_data | {CONF_TOKEN: multi_prm_token}
     assert entry.options == options
-    assert mock_http_session.get.call_count == 2
+    assert mock_http_session.get.call_count == 3
     for request in mock_http_session.get.call_args_list:
         assert request.kwargs["params"]["pointId"] == prm
         assert request.kwargs["headers"]["Authorization"] == f"Bearer {multi_prm_token}"

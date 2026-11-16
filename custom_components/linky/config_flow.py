@@ -126,6 +126,8 @@ class LinkyConfigFlow(ConfigFlow, domain=DOMAIN):
             return [], "prm_access_denied"
         except APIError as err:
             _LOGGER.warning("Could not verify access to the Linky meter: %s", err)
+            if err.status_code == 403:
+                return [], "provider_forbidden"
             return [], "cannot_connect"
         except RuntimeError, ValueError:
             _LOGGER.exception("Unexpected error during Linky token validation")

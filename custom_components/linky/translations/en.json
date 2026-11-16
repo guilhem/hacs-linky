@@ -34,7 +34,8 @@
       "invalid_token": "The token is invalid or expired",
       "prm_access_denied": "This token does not grant access to this meter",
       "unknown": "Unexpected error",
-      "cannot_connect": "The Conso API request failed. Check the Home Assistant logs for details."
+      "cannot_connect": "The Conso API request failed. Check the Home Assistant logs for details.",
+      "provider_forbidden": "Conso API refused the request (HTTP 403). The submitted token was not saved. If it keeps happening, check the Home Assistant logs."
     },
     "abort": {
       "already_configured": "This meter is already configured",
@@ -94,6 +95,12 @@
       "current_production_power": {
         "name": "Latest average export power"
       }
+    }
+  },
+  "issues": {
+    "conso_forbidden": {
+      "title": "Linky refresh refused (meter ending in {meter})",
+      "description": "Conso API returned HTTP 403 on two consecutive daily consumption refreshes. The status alone does not identify the cause. Linky will try again at the next scheduled refresh. Check the Home Assistant logs for details."
     }
   }
 }
