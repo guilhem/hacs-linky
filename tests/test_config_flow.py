@@ -1,4 +1,4 @@
-"""Tests for the Linky config and reauthentication flows."""
+"""Tests for the Linky setup, reconfigure, and reauthentication flows."""
 
 import json
 from asyncio import IncompleteReadError
@@ -13,7 +13,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 
 from custom_components.linky.api import PRMAccessError
-from custom_components.linky.const import CONF_PRM, DOMAIN
+from custom_components.linky.const import CONF_COLLECT_EXPORT, CONF_PRM, CONF_SCAN_INTERVAL, DOMAIN
 
 
 def _mock_error_reply(reply: MagicMock, status: int, body: dict | None) -> None:
@@ -56,6 +56,7 @@ async def test_form_single_prm(
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"] == {CONF_TOKEN: single_prm_token, CONF_PRM: "12345678901234"}
     assert result["result"].unique_id == "12345678901234"
+    assert result["result"].options[CONF_COLLECT_EXPORT] is False
 
 
 async def test_form_multi_prm(
@@ -185,6 +186,76 @@ async def test_form_already_configured(
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
+
+
+async def test_reconfigure_token_during_setup_retry(
+    hass: HomeAssistant,
+    add_linky_entry,
+    single_prm_token: str,
+    multi_prm_token: str,
+    mock_http_session: MagicMock,
+) -> None:
+    """Keep the existing meter and reload only after the provider accepts the new token."""
+    prm = "98765432109876"
+    entry = await add_linky_entry(prm, "old-token")
+    entry_id = entry.entry_id
+    original_data = dict(entry.data)
+    options = {CONF_COLLECT_EXPORT: False, CONF_SCAN_INTERVAL: 12}
+    hass.config_entries.async_update_entry(entry, options=options)
+    entry._async_set_state(hass, config_entries.ConfigEntryState.SETUP_RETRY, None)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_RECONFIGURE, "entry_id": entry_id}
+    )
+    assert entry.supports_reconfigure
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    assert result["description_placeholders"] == {"conso_url": "https://conso.boris.sh", "prm": prm}
+    assert original_data[CONF_TOKEN] not in str(result)
+    flow_id = result["flow_id"]
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as reload_entry:
+        for token, error in [
+            ("invalid-token", "invalid_token"),
+            (single_prm_token, "prm_access_denied"),
+        ]:
+            result = await hass.config_entries.flow.async_configure(flow_id, {CONF_TOKEN: token})
+            assert result["type"] is FlowResultType.FORM
+            assert result["errors"] == {"base": error}
+            assert entry.data == original_data
+        mock_http_session.get.assert_not_called()
+
+        reply = mock_http_session.get.return_value.__aenter__.return_value
+        _mock_error_reply(reply, 401, {"message": "Bearer rejected"})
+        result = await hass.config_entries.flow.async_configure(
+            flow_id, {CONF_TOKEN: multi_prm_token}
+        )
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {"base": "invalid_token"}
+        assert entry.data == original_data
+        reload_entry.assert_not_called()
+
+        _mock_error_reply(
+            reply,
+            404,
+            {"message": "The Enedis API returned an error", "error": {"error": "no_data_found"}},
+        )
+        result = await hass.config_entries.flow.async_configure(
+            flow_id, {CONF_TOKEN: multi_prm_token}
+        )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert hass.config_entries.async_entries(DOMAIN) == [entry]
+    assert entry.entry_id == entry_id
+    assert entry.unique_id == prm
+    assert entry.data == original_data | {CONF_TOKEN: multi_prm_token}
+    assert entry.options == options
+    assert mock_http_session.get.call_count == 2
+    for request in mock_http_session.get.call_args_list:
+        assert request.kwargs["params"]["pointId"] == prm
+        assert request.kwargs["headers"]["Authorization"] == f"Bearer {multi_prm_token}"
+    reload_entry.assert_called_once_with(entry_id)
 
 
 async def test_reauth_keeps_meter_and_reloads(

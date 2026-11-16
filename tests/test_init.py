@@ -12,7 +12,7 @@ from homeassistant.exceptions import ServiceValidationError, Unauthorized
 
 from custom_components.linky import SERVICE_IMPORT_HISTORICAL_DATA
 from custom_components.linky.api import APIError, AuthenticationError, NoDataError
-from custom_components.linky.const import CONF_SCAN_INTERVAL, DOMAIN
+from custom_components.linky.const import CONF_COLLECT_EXPORT, CONF_SCAN_INTERVAL, DOMAIN
 
 pytestmark = pytest.mark.usefixtures("recorder_mock")
 
@@ -65,18 +65,25 @@ async def test_first_refresh_provider_response(
 async def test_reload_from_options(
     hass: HomeAssistant, mock_linky_client, mock_config_entry
 ) -> None:
-    """Saving changed options reloads the entry and applies the new interval."""
+    """Saving options reloads the entry with the new interval and export setting."""
     assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     previous_coordinator = mock_config_entry.runtime_data
+    mock_linky_client.get_daily_production.assert_awaited_once()
+    mock_linky_client.get_production_load_curve.assert_awaited_once()
+    mock_linky_client.reset_mock()
 
     result = await hass.config_entries.options.async_init(mock_config_entry.entry_id)
-    assert set(field.schema for field in result["data_schema"].schema) == {CONF_SCAN_INTERVAL}
-    await hass.config_entries.options.async_configure(result["flow_id"], {CONF_SCAN_INTERVAL: 8})
+    await hass.config_entries.options.async_configure(
+        result["flow_id"], {CONF_SCAN_INTERVAL: 8, CONF_COLLECT_EXPORT: False}
+    )
     await hass.async_block_till_done()
 
     assert mock_config_entry.state is ConfigEntryState.LOADED
     assert mock_config_entry.runtime_data is not previous_coordinator
     assert mock_config_entry.runtime_data.update_interval.total_seconds() == 8 * 3600
+    mock_linky_client.get_daily_consumption.assert_awaited_once()
+    mock_linky_client.get_daily_production.assert_not_awaited()
+    mock_linky_client.get_production_load_curve.assert_not_awaited()
 
 
 async def test_import_targets_selected_loaded_meter(

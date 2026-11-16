@@ -68,6 +68,53 @@ async def _daily(start: date, end: date) -> MeteringData:
     )
 
 
+@pytest.mark.parametrize("historical", [False, True], ids=["refresh", "import"])
+async def test_export_disabled(
+    hass: HomeAssistant, client: MagicMock, write_statistics: AsyncMock, historical: bool
+) -> None:
+    """Skip production requests and writes while collecting both consumption series."""
+    end = _START + _DAY if historical else dt_util.now(PARIS_TZ).date()
+    start = _START if historical else end - 7 * _DAY
+    hour = timedelta(hours=1)
+    first_hour = paris_midnight(start)
+    hours = (paris_midnight(end) - first_hour) // hour
+    curve = MeteringData(
+        _PRM,
+        start,
+        end,
+        [IntervalReading(first_hour + (i + 1) * hour, 500, hour) for i in range(hours)],
+        "W",
+    )
+    client.get_daily_consumption.side_effect = _daily
+    client.get_daily_production.side_effect = _daily
+    for endpoint in (client.get_consumption_load_curve, client.get_production_load_curve):
+        endpoint.side_effect = None
+        endpoint.return_value = curve
+    coordinator = LinkyDataUpdateCoordinator(hass, client, collect_export=False)
+
+    if historical:
+        await coordinator.import_statistics(start, end)
+        client.get_max_power.assert_not_awaited()
+    else:
+        data = await coordinator._async_update_data()
+        assert data.daily_production is None
+        assert data.production_load_curve is None
+        client.get_max_power.assert_awaited_once()
+
+    client.get_daily_production.assert_not_awaited()
+    client.get_production_load_curve.assert_not_awaited()
+    write_statistics.assert_awaited_once_with(
+        hass,
+        _PRM,
+        {
+            ("consumption", "daily"): {
+                paris_midnight(start + i * _DAY): 1.5 for i in range((end - start).days)
+            },
+            ("consumption", "hourly"): {first_hour + i * hour: 0.5 for i in range(hours)},
+        },
+    )
+
+
 @pytest.mark.parametrize("direction", ["consumption", "production"])
 async def test_refresh_overlaps_and_accepts_one_direction(
     hass: HomeAssistant, client: MagicMock, write_statistics: AsyncMock, direction: str

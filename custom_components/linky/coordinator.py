@@ -20,7 +20,13 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .api import APIError, AuthenticationError, HistoryLimitError, NoDataError, fetch_recent
-from .const import API_REQUEST_DELAY, DEFAULT_SCAN_INTERVAL_HOURS, DOMAIN, PARIS_TZ
+from .const import (
+    API_REQUEST_DELAY,
+    DEFAULT_COLLECT_EXPORT,
+    DEFAULT_SCAN_INTERVAL_HOURS,
+    DOMAIN,
+    PARIS_TZ,
+)
 from .statistics import Buckets, async_write_statistics, daily_energy, hourly_energy, paris_midnight
 
 if TYPE_CHECKING:
@@ -62,6 +68,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
         client: LinkyClient,
         scan_interval_hours: int = DEFAULT_SCAN_INTERVAL_HOURS,
         *,
+        collect_export: bool = DEFAULT_COLLECT_EXPORT,
         config_entry: ConfigEntry | None = None,
     ) -> None:
         super().__init__(
@@ -72,6 +79,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             config_entry=config_entry,
         )
         self.client = client
+        self._collect_export = collect_export
         self._meter_lock = asyncio.Lock()
         self._request_lock = hass.data.setdefault(_REQUEST_LOCK, asyncio.Lock())
 
@@ -100,13 +108,16 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 raise ConfigEntryAuthFailed("Linky authentication failed") from err
 
     def _endpoints(self) -> dict[str, Callable[..., Awaitable[MeteringData]]]:
-        return {
+        endpoints = {
             "daily_consumption": self.client.get_daily_consumption,
             "daily_production": self.client.get_daily_production,
             "load_curve": self.client.get_consumption_load_curve,
             "production_load_curve": self.client.get_production_load_curve,
             "max_power": self.client.get_max_power,
         }
+        if not self._collect_export:
+            del endpoints["daily_production"], endpoints["production_load_curve"]
+        return endpoints
 
     async def _async_update_data(self) -> LinkyData:
         """Refetch the previous seven Paris days to include late revisions."""
@@ -185,11 +196,12 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
             raise HomeAssistantError("Wait for Home Assistant to finish starting before importing")
 
         async with self._meter_lock:
-            endpoints = self._endpoints()
             series: dict[tuple[str, str], Buckets] = {}
             errors: list[str] = []
             rate_limited = False
-            for field, key in _ENERGY.items():
+            for field, endpoint in self._endpoints().items():
+                if (key := _ENERGY.get(field)) is None:
+                    continue
                 hourly = key[1] == "hourly"
                 convert = hourly_energy if hourly else daily_energy
                 measured: Buckets = {}
@@ -198,7 +210,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData]):
                 while cursor < end:
                     limit = min(cursor + _CURVE_WINDOW, end) if hourly else end
                     try:
-                        result = await self._fetch(endpoints[field], cursor, limit)
+                        result = await self._fetch(endpoint, cursor, limit)
                         if result is not None and result.interval_reading:
                             saw_readings = True
                             measured.update(convert(result, cursor, limit))

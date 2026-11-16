@@ -15,6 +15,13 @@
           "prm": "Compteur (PRM)"
         }
       },
+      "reconfigure": {
+        "title": "Remplacer le jeton Linky",
+        "description": "Saisissez un nouveau jeton obtenu sur [{conso_url}]({conso_url}) pour le compteur {prm}.",
+        "data": {
+          "token": "Jeton"
+        }
+      },
       "reauth_confirm": {
         "title": "Reconnecter Linky",
         "description": "Saisissez un nouveau jeton obtenu sur [{conso_url}]({conso_url}) pour le compteur {prm}.",
@@ -31,6 +38,7 @@
     },
     "abort": {
       "already_configured": "Ce compteur est déjà configuré",
+      "reconfigure_successful": "Le jeton du compteur a été mis à jour.",
       "reauth_successful": "Le jeton du compteur a été mis à jour."
     }
   },
@@ -58,9 +66,11 @@
       "init": {
         "title": "Options Linky",
         "data": {
-          "scan_interval": "Intervalle de mise à jour"
+          "scan_interval": "Intervalle de mise à jour",
+          "collect_export": "Collecter les données d’injection"
         },
         "data_description": {
+          "collect_export": "À activer si ce compteur mesure de l’électricité injectée sur le réseau. S’applique aussi à l’import d’historique.",
           "scan_interval": "Fréquence de récupération des données, en heures. Les données Linky arrivent avec un délai de 24 à 48 heures."
         }
       }
@@ -69,7 +79,7 @@
   "services": {
     "import_historical_data": {
       "name": "Importer l’historique",
-      "description": "Importe l’historique de consommation et d’injection du compteur Linky sélectionné.",
+      "description": "Importe l’historique de consommation et, si la collecte est activée, d’injection du compteur sélectionné.",
       "fields": {
         "config_entry_id": {
           "name": "Compteur Linky",

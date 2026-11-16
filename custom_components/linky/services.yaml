@@ -1,6 +1,6 @@
 import_historical_data:
   name: Import historical data
-  description: Import historical consumption and export data for the selected Linky meter.
+  description: Import historical consumption and, if collection is enabled, grid export for the selected meter.
   fields:
     config_entry_id:
       name: Linky meter
