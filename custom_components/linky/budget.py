@@ -133,7 +133,7 @@ class ConsoBudget:
         self._save_task = None
         return saved
 
-    async def _async_read(self) -> _BudgetData:
+    async def _async_read(self, *, initialize: bool = True) -> _BudgetData:
         self._check_running()
         await self._async_wait_for_save()
         self._check_running()
@@ -143,6 +143,10 @@ class ConsoBudget:
             self._send_after = get_running_loop().time() + _REQUEST_GAP
         data = await self._hass.async_add_executor_job(self._read_disk)
         now = self._now()
+        if not initialize and (
+            data is None or data["boot_id"] != self._boot_id or now < data["saved_at"]
+        ):
+            raise ConsoBudgetError("The Conso request budget is not initialized for this boot")
         if data is None:
             # Older versions have no ledger; allow their untracked requests to age out.
             data = {
@@ -223,7 +227,14 @@ class ConsoBudget:
             await self._async_read()
 
     async def _async_capacity(
-        self, data: _BudgetData, meter: _MeterBudget, prm: str, now: float, required: int
+        self,
+        data: _BudgetData,
+        meter: _MeterBudget,
+        prm: str,
+        now: float,
+        required: int,
+        *,
+        settle_pending: bool = True,
     ) -> tuple[list[float], ConsoBudgetExceeded | None]:
         requests = [stamp for stamp in meter["requests"] if stamp > now - _WINDOW]
         limit_error = "Conso request limit reached for this meter"
@@ -233,6 +244,10 @@ class ConsoBudget:
         known = self._unconfirmed_cooldowns.get(prm, 0)
         cooldown = meter["cooldown_until"]
         if cooldown == "pending":
+            if not settle_pending:
+                return requests, ConsoBudgetExceeded(
+                    "The previous Conso request could not be confirmed"
+                )
             # A crash or failed settlement left the previous response unknown.
             cooldown = meter["cooldown_until"] = max(now + _WINDOW, known)
             await self._async_save(data)
@@ -257,9 +272,11 @@ class ConsoBudget:
     async def async_get_status(self, prm: str, *, required: int) -> dict[str, Any]:
         """Check capacity without claiming a day or reserving a request."""
         async with self._lock:
-            data = await self._async_read()
+            data = await self._async_read(initialize=False)
             meter = self._meter(data["meters"], prm)
-            requests, blocked = await self._async_capacity(data, meter, prm, self._now(), required)
+            requests, blocked = await self._async_capacity(
+                data, meter, prm, self._now(), required, settle_pending=False
+            )
             reason = str(blocked) if blocked else None
             retry_in = blocked.retry_in if blocked else None
             day = meter["day"]
@@ -268,7 +285,8 @@ class ConsoBudget:
                 next_day = date.fromisoformat(day) + timedelta(days=1)
                 next_slot = datetime.combine(next_day, time(), PARIS_TZ)
                 reason = reason or DAILY_ATTEMPT_USED
-                retry_in = max(retry_in or 0.0, next_slot.timestamp() - now.timestamp())
+                if blocked is None or retry_in is not None:
+                    retry_in = max(retry_in or 0.0, next_slot.timestamp() - now.timestamp())
             return {
                 "requests_remaining": max(0, _LIMIT - len(requests)),
                 "last_daily_attempt": day,

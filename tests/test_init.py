@@ -263,28 +263,42 @@ async def test_import_dates_permissions_and_failure(
             await call(data)
 
 
-async def test_unload_interrupts_import(
-    hass: HomeAssistant, mock_linky_client, mock_config_entry
+@pytest.mark.parametrize(
+    ("service", "method", "action", "fields"),
+    [
+        (
+            SERVICE_IMPORT_HISTORICAL_DATA,
+            "import_statistics",
+            "import",
+            {"start_date": "2026-01-02"},
+        ),
+        (SERVICE_REFRESH, "async_refresh_now", "refresh", {}),
+        (SERVICE_GET_STATUS, "async_get_status", "status check", {}),
+    ],
+)
+async def test_unload_interrupts_meter_actions(
+    hass: HomeAssistant, mock_linky_client, mock_config_entry, service, method, action, fields
 ) -> None:
-    """Do not let an import keep running with the unloaded entry's coordinator."""
+    """Do not let a service keep using the unloaded entry's coordinator."""
     assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     started = asyncio.Event()
 
-    async def pending_import(start: date, end: date) -> None:
+    async def pending_action(*args) -> None:
         started.set()
         await asyncio.Future()
 
-    with patch.object(mock_config_entry.runtime_data, "import_statistics", pending_import):
-        action = asyncio.create_task(
+    with patch.object(mock_config_entry.runtime_data, method, pending_action):
+        call = asyncio.create_task(
             hass.services.async_call(
                 DOMAIN,
-                SERVICE_IMPORT_HISTORICAL_DATA,
-                {"config_entry_id": mock_config_entry.entry_id, "start_date": "2026-01-02"},
+                service,
+                {"config_entry_id": mock_config_entry.entry_id} | fields,
                 blocking=True,
+                return_response=service == SERVICE_GET_STATUS,
             )
         )
         async with asyncio.timeout(5):
             await started.wait()
         assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
-        with pytest.raises(ServiceValidationError, match="unloaded during import"):
-            await action
+        with pytest.raises(ServiceValidationError, match=f"unloaded during {action}"):
+            await call

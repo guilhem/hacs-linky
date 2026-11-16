@@ -106,7 +106,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     async def handle_get_status(call: ServiceCall) -> ServiceResponse:
         """Read local collection status without contacting Conso."""
-        return await get_loaded_entry(call).runtime_data.async_get_status()
+        entry = get_loaded_entry(call)
+        return await run_entry_action(entry, "status check", entry.runtime_data.async_get_status())
 
     async_register_admin_service(
         hass,

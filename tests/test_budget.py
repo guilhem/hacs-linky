@@ -268,6 +268,8 @@ async def test_uptime_reset_pauses_all_requests_and_carries_cooldown(
     # For changed IDs, even a larger uptime belongs to a different monotonic timeline.
     clock.elapsed = 1.0 if reset == "regression" else 10.0 * _WINDOW
     reopened = async_get_conso_budget(HomeAssistant(str(tmp_path)))
+    with pytest.raises(ConsoBudgetError, match="not initialized for this boot"):
+        await reopened.async_get_status(_PRM, required=1)
     await reopened.async_initialize()
     assert not await _claim(reopened, _PRM, _DAY)
     with pytest.raises(ConsoBudgetExceeded, match="budget initialization"):
@@ -386,7 +388,8 @@ async def test_failed_cooldown_write_preserves_the_error_and_blocks_on_restart(
     assert status["last_daily_attempt"] is None
     assert not status["can_refresh"]
     assert status["requests_remaining"] == 2
-    assert status["retry_in_seconds"] == _WINDOW
+    assert status["retry_in_seconds"] is None
+    clock.elapsed += 17  # The read did not start the pending request's cooldown.
     with pytest.raises(ConsoBudgetExceeded, match="paused") as error:
         await _admit(reopened)
     assert error.value.retry_in == _WINDOW
