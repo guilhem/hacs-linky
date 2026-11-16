@@ -1,139 +1,112 @@
 # Linky for Home Assistant
 
-Bring the electricity measured by your Linky meter into Home Assistant's **Energy** dashboard. See how much you drew from the grid and, if your installation exports electricity, how much you sent back.
+See your Linky meter's electricity use in Home Assistant's Energy dashboard.
+Linky collects consumption through [Conso API](https://conso.boris.sh/) and can
+also collect electricity you send back to the grid. To fill older gaps, you
+can import a Conso Downloader CSV without contacting Conso.
 
-Home Assistant fetches readings through [Conso API](https://conso.boris.sh/), using
-[Enedis Mesure synchrone V2](https://conso.boris.sh/migration-2026/). Enedis publishes
-readings after the day they were measured, usually the following morning. Linky
-refreshes once each morning in Paris time. A power sensor shows the latest
-*published* interval; it cannot track a live load.
+## Install Linky and connect a meter
 
-```mermaid
-flowchart LR
-    A[Linky readings from Enedis] --> B[Conso API]
-    B --> C[Linky integration]
-    C --> D[Latest readings on the device page]
-    C --> E[History in the Energy dashboard]
-```
+You need Home Assistant **2026.11.1 or later** with Recorder enabled, a
+[Conso API token](https://conso.boris.sh/) for your meter, and Enedis data
+collection enabled. Hourly charts require Enedis load curve access. If Enedis
+only publishes daily totals for your meter, Linky can use those instead.
 
-## Connect a meter
+1. [![Open Linky in your Home Assistant Marketplace](https://my.home-assistant.io/badges/marketplace_repository.svg)](https://my.home-assistant.io/redirect/marketplace_repository/?owner=guilhem&repository=hacs-linky&category=integration)
 
-You need Home Assistant **2026.11.1 or later** with Recorder enabled, a Linky
-meter, and a [Conso API token](https://conso.boris.sh/). Enable data collection
-with Enedis; hourly Energy charts also require access to the load curve.
-
-1. [Open Linky in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=guilhem&repository=hacs-linky&category=integration).
-   You can also add `https://github.com/guilhem/hacs-linky` as an **Integration**
-   from HACS's **Custom repositories** menu.
-2. Download **Linky** and restart Home Assistant. For a manual installation,
-   copy `custom_components/linky` into Home Assistant's `config/custom_components`
+   Download **Linky** and restart Home Assistant. If the link is unavailable,
+   add `https://github.com/guilhem/hacs-linky` as an **Integration** in the
+   Marketplace or HACS custom repositories menu. To install manually, copy
+   `custom_components/linky` into Home Assistant's `config/custom_components`
    directory and restart.
-3. Open **Settings → Devices & services → Add integration → Linky** and enter
-   the token. If the token covers multiple meters, select the meter you want.
-   Run the setup again for each additional meter. If the request budget was
-   just initialized, wait 24 hours before submitting the token again.
-4. After the next scheduled refresh, open the Linky device page.
-   **Daily consumption** displays the latest published day. Its `last_date`
-   attribute tells you when it was measured.
+2. [Add Linky to Home Assistant](https://my.home-assistant.io/redirect/config_flow_start/?domain=linky).
+   Enter the Conso token and select the meter if prompted. Repeat for each
+   additional meter. If Home Assistant reports an initial 24-hour pause, leave
+   it running and retry the form when the pause ends.
+3. After the first eligible refresh, open the meter from the
+   [Linky integration page](https://my.home-assistant.io/redirect/integration/?domain=linky).
+   **Daily consumption** shows the latest published day. Its `last_date`
+   attribute is the day the reading was measured. Enedis usually publishes
+   readings the following morning; the average power sensor is a published
+   interval, not a live reading.
 
-## Change a meter's settings
+Find downloads and changes under [GitHub Releases](https://github.com/guilhem/hacs-linky/releases).
 
-Open **Settings → Devices & services → Linky** and use the meter's menu:
+## Show the meter in Energy
 
-- **Reconfigure** replaces the Conso token for this meter. Home Assistant
-  verifies that the new token works for the same meter before saving it.
-  Your entities, preferences, and Energy history stay in place.
-- **Configure** controls grid export collection and **Daily totals only**.
-  The default uses one consumption load-curve request to fill both hourly and
-  daily Energy statistics. Choose **Daily totals only** if your meter does not
-  have a load curve, and select the daily statistic in Energy. This mode
-  does not update the average power sensor.
-- Export collection is off for newly added meters. Enable it if you send
-  electricity back to the grid. It uses one additional request per refresh.
-  These settings also apply to historical imports. Existing Energy history is
-  kept. The daily maximum apparent power sensor is no longer updated, because
-  that measurement requires its own request.
+1. [Open Energy configuration](https://my.home-assistant.io/redirect/config_energy/).
+   Under **Grid consumption**, select `Linky {PRM} hourly consumption (kWh)`.
+   If you enabled export collection, use `Linky {PRM} hourly production (kWh)`
+   under **Return to grid**.
+2. If your meter only provides daily totals, select its **daily** statistic
+   instead. Use only one resolution per meter and direction to avoid double
+   counting. Set the Home Assistant time zone to `Europe/Paris` to align days
+   with Linky.
+3. [Open the Energy dashboard](https://my.home-assistant.io/redirect/energy/)
+   and select a day with published readings.
 
-Linky allows up to **three Conso requests per meter in any 24-hour period**,
-including token checks, failed requests, and manual imports. Home Assistant
-remembers this budget across restarts. Startup does not trigger a refresh.
-The first time the budget is initialized, Linky waits 24 hours so any requests
-from a previous version can age out. Linky also pauses for 24 hours if the system
-uptime resets, because elapsed time from the previous boot cannot be verified.
-The refresh fills in available readings from
-the previous seven days. It starts in the morning, or later that day if the
-meter's request budget is still in use.
-See [Conso's usage rules](https://conso.boris.sh/blocage-ip).
+The device page shows the latest reading. The named statistics hold the
+history used by Energy. Linky supplies energy quantities; any cost for an
+external statistic needs a separate cost statistic.
 
-Export measures electricity sent to the grid. For the latest export readings
-on the device page, also enable the export sensors in the meter's entity list.
+## Fill gaps or check a refresh
 
-## Add the meter to Energy
+Open [Tools → Actions](https://my.home-assistant.io/redirect/tools_actions/)
+as a Home Assistant administrator, or use one of the links below to select
+the action. Then choose the meter.
 
-Open **Settings → Dashboards → Energy**. Under **Grid consumption**, select
-`Linky {PRM} hourly consumption (kWh)`. If you export, select
-`Linky {PRM} hourly production (kWh)` under **Return to grid**. Use the
-corresponding **daily** statistic when hourly data is unavailable. Adding both
-resolutions for the same meter and direction would count the electricity twice.
-Use the `Europe/Paris` time zone in Home Assistant to align calendar days with Linky.
-
-The device's latest daily reading is a snapshot; choose the named Linky
-statistics for Energy history. Linky publishes energy quantities only. To show
-a cost for an external statistic, Energy needs a separate cost statistic.
-
-## Run a Linky action
-
-As an administrator, open **Developer Tools → Actions**, search for **Linky**,
-and select a meter.
-
-| Action | When to use it |
+| Action | What it does |
 | --- | --- |
-| **Refresh now** | Run the daily refresh before its scheduled time. The result indicates whether it ran or why it was skipped. A manual attempt uses the same daily slot and request budget as the scheduled refresh. |
-| **Get collection status** | See how many requests are left in the rolling 24-hour budget and why the meter might have to wait. This does not contact Conso. |
-| **Import historical data** | Fetch up to seven days from Conso for Energy. This uses the same request budget. |
-| **Import a Conso Downloader CSV** | Fill gaps in the hourly consumption series from an uploaded file without contacting Conso. |
+| [Refresh now](https://my.home-assistant.io/redirect/tools_perform_action/?service=linky.refresh) | Uses the same daily attempt and request limit as the automatic refresh. The response says whether it ran or why it was skipped. |
+| [Get collection status](https://my.home-assistant.io/redirect/tools_perform_action/?service=linky.get_status) | Shows remaining requests, the last daily attempt, and why collection may have to wait. It does not contact Conso. |
+| [Import historical data](https://my.home-assistant.io/redirect/tools_perform_action/?service=linky.import_historical_data) | Fetches up to seven days from Conso. The start date is included and the end date is excluded. The end defaults to today in Paris. |
+| [Import a Conso Downloader CSV](https://my.home-assistant.io/redirect/tools_perform_action/?service=linky.import_conso_csv) | Adds missing **hourly consumption** points from a file. It preserves existing measurements and does not contact Conso. |
 
-For a historical import, enter the first day to include, then the first day to
-exclude. For example, **2026-10-01** to **2026-10-08** imports the first seven
-days of October. The end defaults to today in Paris. Import at most seven days
-at a time, within the same request budget as the scheduled refresh. A partial
-result reports missing or failed data. You can import the same dates again
-without double counting once the oldest attempts are more than 24 hours old.
-Missing hours are left as gaps, and a day is not added to the daily statistics
-until its load curve is complete.
+To import a CSV, upload the `historique_conso_<PRM>_<date>.csv` file from
+[Conso Downloader](https://github.com/bokub/conso-downloader). Linky checks that
+the meter number in the filename matches the selected meter. The response
+lists added, identical, and conflicting hours, plus timestamps the CSV
+could not reconstruct, such as ambiguous hours around clock changes.
+A conflict keeps the value already in Energy. Uploading and importing the
+same file again adds zero points. Check the result using the hourly
+consumption series in Energy.
 
-To fill a longer gap, select **Import a Conso Downloader CSV**, choose the meter,
-and upload its `historique_conso_<PRM>_<date>.csv` from
-[Conso Downloader](https://github.com/bokub/conso-downloader). Keep the meter
-number in the filename so Linky can match it. Check the response for counts of
-added, identical, and conflicting hours. If the file disagrees with an existing
-hour, the value in Energy is kept. Uploading the same file again adds no points.
+## Manage the meter and its request limit
 
-The CSV action imports **hourly consumption** only. It reports the timestamps
-of incomplete or ambiguous hours, including clock changes the export does not
-disambiguate. Use the meter's hourly consumption series in Energy to see the
-result.
+On the [Linky integration page](https://my.home-assistant.io/redirect/integration/?domain=linky),
+use **Reconfigure** to replace the token without losing the meter's history.
+Use **Configure** to turn on grid export if your meter sends electricity
+back, or select **Daily totals only** if the load curve is unavailable.
+Daily-only collection does not update the average power sensor. To monitor
+export on the device page, enable the export sensors in the entity list.
 
-## If data is missing
+Linky attempts one automatic refresh per day. The refresh starts in the
+morning or later if it must wait for the request budget, and collects
+available readings for the previous seven days. Export uses a second
+request. Startup does not trigger a refresh. The limit is **three requests
+per meter in any rolling 24 hours**, including failures, token checks, and
+Conso imports. The budget survives a Home Assistant restart. Initialization
+and a full host reboot start a 24-hour pause to account for earlier
+requests. See [Conso's usage rules](https://conso.boris.sh/blocage-ip).
 
-| What you see | What to check |
-| --- | --- |
-| Your token expired or you generated a replacement | Open the meter’s **Reconfigure** menu. If Home Assistant already opened a repair, you can also enter the new token there. |
-| Daily readings are visible but no hourly series appears | Check that Enedis load curve collection is enabled and that Conso can return interval data. You can use the daily statistic in Energy. |
-| Today's readings are absent | Check the reading date on the sensor. Conso does not publish a live feed. |
+If values are missing, open **Get collection status** first. If Conso rejects
+your token, use **Reconfigure** or follow the repair in Home Assistant. If
+daily totals are visible but hourly history is missing, check Enedis load
+curve consent or import a CSV. The maximum apparent power sensor requires
+a separate request and is no longer collected.
 
 ## Develop
 
-Use [uv](https://docs.astral.sh/uv/) with Python 3.14. After cloning the repository:
+Use [uv](https://docs.astral.sh/uv/) with Python 3.14:
 
 ```sh
-uv run --extra dev ruff check
-uv run --extra dev ruff format --check
-uv run --extra dev pytest
+uv run --python 3.14 --extra dev ruff check
+uv run --python 3.14 --extra dev ruff format --check
+uv run --python 3.14 --extra dev pytest
 ```
 
-The tests use Home Assistant and simulated Conso responses. No meter or token is
-required. Report issues with the Home Assistant version and the affected
-feature; remove tokens and meter identifiers from logs before sharing them.
+The tests use Home Assistant, a local Recorder, and simulated Conso responses.
+No meter or token is required. When [reporting an issue](https://github.com/guilhem/hacs-linky/issues),
+include the Home Assistant version and remove tokens and meter identifiers.
 
 [MIT license](LICENSE)
