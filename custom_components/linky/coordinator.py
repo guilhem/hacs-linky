@@ -77,18 +77,19 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData | None]):
         self._collect_export = collect_export
         self._daily_only = daily_only
         self._meter_lock = asyncio.Lock()
-        self._skipped_update_success: bool | None = None
+        self._skipped_update: tuple[bool, BaseException | None] | None = None
         self._conso_forbidden_pending: WeakKeyDictionary[ConfigEntry, bool] = hass.data.setdefault(
             _CONSO_FORBIDDEN_PENDING, WeakKeyDictionary()
         )
 
     @callback
     def async_start(self) -> None:
-        """Register the meter's daily UTC slot without fetching on setup."""
+        """Check for a daily slot each hour after the morning start time."""
         cancel = async_track_utc_time_change(
             self.hass,
             self._async_daily_slot,
-            hour=7,
+            # An earlier batch can still occupy the rolling budget at the first slot.
+            hour=range(7, 22),
             minute=30 + int(self.client.prm) % 30,
             second=0,
         )
@@ -224,11 +225,14 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData | None]):
         """Refetch the previous seven Paris days to include late revisions."""
         async with self._meter_lock:
             end = dt_util.now(PARIS_TZ).date()
-            self._skipped_update_success = None
+            self._skipped_update = None
+            if self.hass.state is not CoreState.running:
+                return self._skip_update()
+            budget = async_get_conso_budget(self.hass)
             try:
-                if self.hass.state is not CoreState.running or not await async_get_conso_budget(
-                    self.hass
-                ).async_claim_daily(self.client.prm, end):
+                if not await budget.async_claim_daily(
+                    self.client.prm, end, required=2 if self._collect_export else 1
+                ):
                     return self._skip_update()
                 data, series, errors = await self._async_fetch_window(end - _MAX_WINDOW, end)
             except ConsoBudgetExceeded as err:
@@ -252,15 +256,17 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData | None]):
             return data
 
     def _skip_update(self) -> LinkyData | None:
-        self._skipped_update_success = self.last_update_success
+        if not self.last_update_success:
+            # Keep the original failure and avoid HA logging a recovery on a skip.
+            self._skipped_update = self.last_update_success, self.last_exception
+            raise UpdateFailed("No Conso request was sent")
         return self.data
 
     @callback
     def _async_refresh_finished(self) -> None:
-        # The base coordinator marks a return as success before it notifies listeners.
-        if self._skipped_update_success is not None:
-            self.last_update_success = self._skipped_update_success
-            self._skipped_update_success = None
+        if self._skipped_update is not None:
+            self.last_update_success, self.last_exception = self._skipped_update
+            self._skipped_update = None
 
     async def import_statistics(self, start: date, end: date) -> None:
         """Import one bounded date range and report any partial failure."""

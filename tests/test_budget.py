@@ -1,10 +1,11 @@
 """Exercise Conso admission and cooldown with Home Assistant's on-disk store."""
 
-from asyncio import CancelledError, Event, create_task, gather, sleep
+from asyncio import CancelledError, Event, create_task, gather, get_running_loop, sleep
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from freezegun import freeze_time
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers import storage
 
@@ -18,6 +19,7 @@ from custom_components.linky.const import PARIS_TZ
 
 _PRM = "99999999999999"
 _OTHER_PRM = "00000000000001"
+_THIRD_PRM = "00000000000002"
 _START = datetime(2026, 10, 24, 21, 59, tzinfo=UTC)
 _DAY = _START.astimezone(PARIS_TZ).date()
 _WINDOW = 24 * 60 * 60
@@ -26,7 +28,6 @@ _WINDOW = 24 * 60 * 60
 @pytest.fixture
 def clock(monkeypatch):
     instant = SimpleNamespace(wall=_START.timestamp(), elapsed=0.0)
-    monkeypatch.setattr(budget_module, "time", lambda: instant.wall)
     monkeypatch.setattr(budget_module, "monotonic", lambda: instant.elapsed)
     return instant
 
@@ -89,13 +90,16 @@ async def test_claim_is_shared_durable_and_once_per_paris_day(tmp_path, ready):
     assert not await reopened.async_claim_daily(_PRM, _DAY)
 
 
-async def test_request_is_serialized_across_meters(ready):
+async def test_request_is_serialized_and_spaced_across_meters(ready):
     _, budget = ready
     entering, entered, finish = Event(), Event(), Event()
+    loop = get_running_loop()
+    times = []
 
     async def other_meter():
         entering.set()
         async with budget.request(_OTHER_PRM):
+            times.append(loop.time())
             entered.set()
             await finish.wait()
 
@@ -103,14 +107,19 @@ async def test_request_is_serialized_across_meters(ready):
         task = create_task(other_meter())
         await entering.wait()
         assert not entered.is_set()
+        times.append(loop.time())
     await entered.wait()
     finish.set()
     await task
+    assert times[1] - times[0] >= 0.2
 
 
 async def test_limit_rolls_across_paris_midnight_dst_and_restart(tmp_path, clock, ready):
     _, budget = ready
-    for _ in range(3):
+    async with budget.request(_PRM):
+        clock.elapsed += 1
+        clock.wall += 1
+    for _ in range(2):
         await _admit(budget)
     with pytest.raises(ConsoBudgetExceeded, match="limit reached"):
         await _admit(budget)
@@ -121,30 +130,90 @@ async def test_limit_rolls_across_paris_midnight_dst_and_restart(tmp_path, clock
     tomorrow = datetime.fromtimestamp(clock.wall, PARIS_TZ).date()
     assert tomorrow != _DAY
     budget = async_get_conso_budget(HomeAssistant(str(tmp_path)))
-    assert await budget.async_claim_daily(_PRM, tomorrow)
     with pytest.raises(ConsoBudgetExceeded, match="limit reached"):
-        await _admit(budget)
+        await budget.async_claim_daily(_PRM, tomorrow)
 
-    clock.elapsed = 2 * _WINDOW - 1
+    clock.elapsed = 2 * _WINDOW
     with pytest.raises(ConsoBudgetExceeded, match="limit reached"):
         await _admit(budget)
-    clock.elapsed = 2 * _WINDOW
+    clock.elapsed += 1
+    assert await budget.async_claim_daily(_PRM, tomorrow)
     await _admit(budget)
 
 
-async def test_clock_changes_cannot_refill_the_budget_early(tmp_path, clock, ready):
+async def test_wall_clock_jump_and_restart_on_same_boot_do_not_refill(tmp_path, clock, ready):
     _, budget = ready
     for _ in range(3):
         await _admit(budget)
     clock.wall += 2 * _WINDOW
-    with pytest.raises(ConsoBudgetExceeded):
-        await _admit(budget)
+    with freeze_time(datetime.fromtimestamp(clock.wall, UTC), real_asyncio=True):
+        reopened = async_get_conso_budget(HomeAssistant(str(tmp_path)))
+        clock.elapsed += 60
+        with pytest.raises(ConsoBudgetExceeded, match="limit reached"):
+            await _admit(reopened)
 
-    clock.wall = _START.timestamp() - 60
+
+@pytest.mark.parametrize("reset", ["boot", "fallback", "regression"])
+async def test_uptime_reset_pauses_all_requests_and_carries_cooldown(
+    tmp_path, clock, monkeypatch, reset
+):
+    boot_id = tmp_path / "boot_id"
+    monkeypatch.setattr(budget_module, "_BOOT_ID_PATH", boot_id)
+    if reset != "fallback":
+        boot_id.write_text("0d7348f8-7574-4a71-9c57-f72d3fccc269", encoding="ascii")
+    budget = async_get_conso_budget(HomeAssistant(str(tmp_path)))
+    await budget.async_initialize()
+    clock.elapsed += _WINDOW
+    assert await budget.async_claim_daily(_PRM, _DAY)
+    for _ in range(3):
+        await _admit(budget)
+    async with budget.request(_OTHER_PRM) as mark_cooldown:
+        mark_cooldown(2 * _WINDOW)
+    clock.elapsed += _WINDOW / 2
+    assert await budget.async_claim_daily(_THIRD_PRM, _DAY)
+
+    if reset == "boot":
+        boot_id.write_text("ef65b0e4-3825-4a83-b718-1d31ff366ff1", encoding="ascii")
+    elif reset == "fallback":
+        monkeypatch.setattr(budget_module, "_PROCESS_BOOT_ID", "process:new")
+    # For changed IDs, even a larger uptime belongs to a different monotonic timeline.
+    clock.elapsed = 1.0 if reset == "regression" else 10.0 * _WINDOW
     reopened = async_get_conso_budget(HomeAssistant(str(tmp_path)))
-    clock.elapsed += 60
+    await reopened.async_initialize()
+    assert not await reopened.async_claim_daily(_PRM, _DAY)
+    with pytest.raises(ConsoBudgetExceeded, match="budget initialization"):
+        await _admit(reopened)
+
+    clock.elapsed += _WINDOW
+    for _ in range(3):
+        await _admit(reopened)
     with pytest.raises(ConsoBudgetExceeded, match="limit reached"):
         await _admit(reopened)
+    clock.elapsed += _WINDOW / 2 - 1
+    with pytest.raises(ConsoBudgetExceeded, match="paused"):
+        await reopened.async_claim_daily(_OTHER_PRM, _DAY)
+    clock.elapsed += 1
+    assert await reopened.async_claim_daily(_OTHER_PRM, _DAY)
+    await _admit(reopened, _OTHER_PRM)
+
+
+async def test_insufficient_slots_do_not_claim_the_day_or_wait(ready, clock, monkeypatch):
+    _, budget = ready
+    for _ in range(2):
+        await _admit(budget)
+    with pytest.raises(ConsoBudgetExceeded, match="limit reached"):
+        await budget.async_claim_daily(_PRM, _DAY, required=2)
+    await _admit(budget)
+
+    async def unexpected_sleep(_):
+        pytest.fail("A request without capacity waited for spacing")
+
+    monkeypatch.setattr(budget_module, "sleep", unexpected_sleep)
+    with pytest.raises(ConsoBudgetExceeded, match="limit reached"):
+        await _admit(budget)
+    clock.elapsed += _WINDOW
+    assert await budget.async_claim_daily(_PRM, _DAY, required=2)
+    assert not await budget.async_claim_daily(_PRM, _DAY, required=3)
 
 
 async def test_failed_and_cancelled_attempts_are_not_refunded(tmp_path, ready):

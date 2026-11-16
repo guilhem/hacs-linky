@@ -1,6 +1,7 @@
 """Test Linky daily scheduling, measurements, and bounded imports."""
 
 import asyncio
+import logging
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -30,6 +31,7 @@ from custom_components.linky.budget import (
     ConsoBudget,
     ConsoBudgetError,
     ConsoBudgetExceeded,
+    async_get_conso_budget,
 )
 from custom_components.linky.const import DOMAIN, PARIS_TZ
 from custom_components.linky.coordinator import LinkyData, LinkyDataUpdateCoordinator
@@ -118,7 +120,7 @@ async def test_daily_slot_claim_precedes_refresh_and_survives_reload(
         track.assert_called_once()
         slot = track.call_args.args[1]
         minute = track.call_args.kwargs["minute"]
-        assert track.call_args.kwargs == {"hour": 7, "minute": minute, "second": 0}
+        assert track.call_args.kwargs == {"hour": range(7, 22), "minute": minute, "second": 0}
         assert 30 <= minute <= 59
 
     assert not client.mock_calls
@@ -183,6 +185,7 @@ async def test_generic_refreshes_share_one_daily_attempt(
     write_statistics: AsyncMock,
     monkeypatch: pytest.MonkeyPatch,
     first_error: Exception | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A same-day generic refresh preserves the earlier result, even if it failed."""
     now = dt_util.now(PARIS_TZ)
@@ -204,7 +207,9 @@ async def test_generic_refreshes_share_one_daily_attempt(
     assert (first_data is None) == (first_error is not None)
     assert notify.call_count == notification_count
 
-    await coordinator.async_refresh()
+    with caplog.at_level(logging.INFO):
+        await coordinator.async_refresh()
+    assert "data recovered" not in caplog.text
     consumption.assert_awaited_once()
     assert coordinator.data is first_data
     assert coordinator.last_exception is last_exception
@@ -219,6 +224,29 @@ async def test_generic_refreshes_share_one_daily_attempt(
     assert coordinator.last_update_success
     assert coordinator.data.daily_consumption.end == now.date()
     assert notify.call_count == notification_count + 1
+
+
+async def test_export_defers_until_the_batch_fits_in_the_rolling_budget(
+    hass: HomeAssistant, client: MagicMock, write_statistics: AsyncMock, budget_clock
+) -> None:
+    """One spare request is not enough for a meter with import and export enabled."""
+    budget = async_get_conso_budget(hass)
+    for _ in range(2):
+        async with budget.request(_PRM):
+            pass
+    coordinator = LinkyDataUpdateCoordinator(hass, client, collect_export=True)
+    client.get_consumption_load_curve.side_effect = _curve
+    client.get_production_load_curve.side_effect = _curve
+
+    await coordinator.async_refresh()
+    client.get_consumption_load_curve.assert_not_awaited()
+    client.get_production_load_curve.assert_not_awaited()
+
+    budget_clock.elapsed += 24 * 60 * 60 + 1
+    await coordinator.async_refresh()
+    client.get_consumption_load_curve.assert_awaited_once()
+    client.get_production_load_curve.assert_awaited_once()
+    write_statistics.assert_awaited_once()
 
 
 async def test_slot_skips_startup_and_disabled_polling(

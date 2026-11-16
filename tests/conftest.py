@@ -4,7 +4,6 @@ from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from shutil import copytree
-from time import time
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -42,9 +41,7 @@ def mock_http_session() -> MagicMock:
 
 @pytest.fixture
 def budget_clock(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    start = time()
     clock = SimpleNamespace(elapsed=0.0)
-    monkeypatch.setattr(budget_module, "time", lambda: start + clock.elapsed)
     monkeypatch.setattr(budget_module, "monotonic", lambda: clock.elapsed)
     return clock
 

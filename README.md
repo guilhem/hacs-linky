@@ -58,8 +58,11 @@ Linky allows up to **three Conso requests per meter in any 24-hour period**,
 including token checks, failed requests, and manual imports. Home Assistant
 remembers this budget across restarts. Startup does not trigger a refresh.
 The first time the budget is initialized, Linky waits 24 hours so any requests
-from a previous version can age out. The scheduled morning refresh fills in
-available readings from the previous seven days.
+from a previous version can age out. Linky also pauses for 24 hours if the system
+uptime resets, because elapsed time from the previous boot cannot be verified.
+The refresh fills in available readings from
+the previous seven days. It starts in the morning, or later that day if the
+meter's request budget is still in use.
 See [Conso's usage rules](https://conso.boris.sh/blocage-ip).
 
 Export measures electricity sent to the grid. For the latest export readings

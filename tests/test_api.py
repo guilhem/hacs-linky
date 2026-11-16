@@ -64,8 +64,6 @@ def http():
 @pytest.fixture
 async def ready_budget(tmp_path, monkeypatch):
     elapsed = 0.0
-    wall = datetime(2026, 11, 16, tzinfo=UTC).timestamp()
-    monkeypatch.setattr(budget_module, "time", lambda: wall + elapsed)
     monkeypatch.setattr(budget_module, "monotonic", lambda: elapsed)
     budget = async_get_conso_budget(HomeAssistant(str(tmp_path)))
     await budget.async_initialize()
