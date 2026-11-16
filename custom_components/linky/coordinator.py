@@ -16,7 +16,7 @@ from homeassistant.exceptions import (
     ServiceValidationError,
 )
 from homeassistant.helpers import issue_registry as ir
-from homeassistant.helpers.event import async_track_utc_time_change
+from homeassistant.helpers.event import async_call_later, async_track_utc_time_change
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -33,6 +33,8 @@ from .statistics import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
@@ -77,6 +79,7 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData | None]):
         self._collect_export = collect_export
         self._daily_only = daily_only
         self._meter_lock = asyncio.Lock()
+        self._cancel_deferred: Callable[[], None] | None = None
         self._skipped_update: tuple[bool, BaseException | None] | None = None
         self._conso_forbidden_pending: WeakKeyDictionary[ConfigEntry, bool] = hass.data.setdefault(
             _CONSO_FORBIDDEN_PENDING, WeakKeyDictionary()
@@ -95,10 +98,38 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData | None]):
         )
         if self.config_entry is not None:
             self.config_entry.async_on_unload(cancel)
+            self.config_entry.async_on_unload(self._async_cancel_deferred)
+
+    @callback
+    def _async_cancel_deferred(self) -> None:
+        if self._cancel_deferred is not None:
+            self._cancel_deferred()
+            self._cancel_deferred = None
+
+    def _defer_daily_slot(self, day: date, retry_in: float | None) -> None:
+        if (
+            retry_in is None
+            or self._cancel_deferred is not None
+            or self.config_entry is None
+            or self.config_entry.pref_disable_polling
+        ):
+            return
+        delay = max(1.0, retry_in)
+        remaining = (paris_midnight(day + timedelta(days=1)) - dt_util.utcnow()).total_seconds()
+        if delay >= remaining:
+            return
+
+        @callback
+        def run_slot(when: datetime) -> None:
+            self._cancel_deferred = None
+            if dt_util.now(PARIS_TZ).date() == day:
+                self._async_daily_slot(when)
+
+        self._cancel_deferred = async_call_later(self.hass, delay, run_slot)
 
     @callback
     def _async_daily_slot(self, _when: datetime) -> None:
-        if self.hass.state is not CoreState.running:
+        if self.hass.state is not CoreState.running or self._cancel_deferred is not None:
             return
         entry = self.config_entry
         if entry is not None and entry.pref_disable_polling:
@@ -230,12 +261,15 @@ class LinkyDataUpdateCoordinator(DataUpdateCoordinator[LinkyData | None]):
                 return self._skip_update()
             budget = async_get_conso_budget(self.hass)
             try:
-                if not await budget.async_claim_daily(
+                async with budget.daily_batch(
                     self.client.prm, end, required=2 if self._collect_export else 1
-                ):
-                    return self._skip_update()
-                data, series, errors = await self._async_fetch_window(end - _MAX_WINDOW, end)
+                ) as claimed:
+                    if not claimed:
+                        return self._skip_update()
+                    self._async_cancel_deferred()
+                    data, series, errors = await self._async_fetch_window(end - _MAX_WINDOW, end)
             except ConsoBudgetExceeded as err:
+                self._defer_daily_slot(end, err.retry_in)
                 _LOGGER.debug("Deferring the Linky refresh: %s", err)
                 return self._skip_update()
             except ConsoBudgetError as err:

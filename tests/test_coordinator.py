@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from freezegun import freeze_time
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.exceptions import (
@@ -71,7 +72,7 @@ def write_statistics(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 def allow_every_claim(monkeypatch: pytest.MonkeyPatch) -> None:
     """Allow multiple provider outcomes when testing the repair and auth paths."""
     budget = MagicMock()
-    budget.async_claim_daily = AsyncMock(return_value=True)
+    budget.daily_batch.return_value.__aenter__.return_value = True
     monkeypatch.setattr(
         "custom_components.linky.coordinator.async_get_conso_budget", lambda _hass: budget
     )
@@ -132,7 +133,8 @@ async def test_daily_slot_claim_precedes_refresh_and_survives_reload(
     budget_after_restart = ConsoBudget(hass)
 
     async def check_claim(start: date, end: date) -> MeteringData:
-        assert not await budget_after_restart.async_claim_daily(_PRM, today)
+        async with budget_after_restart.daily_batch(_PRM, today) as claimed:
+            assert not claimed
         return await _curve(start, end)
 
     client.get_consumption_load_curve.side_effect = check_claim
@@ -227,26 +229,41 @@ async def test_generic_refreshes_share_one_daily_attempt(
 
 
 async def test_export_defers_until_the_batch_fits_in_the_rolling_budget(
-    hass: HomeAssistant, client: MagicMock, write_statistics: AsyncMock, budget_clock
+    hass: HomeAssistant,
+    client: MagicMock,
+    write_statistics: AsyncMock,
+    mock_config_entry: ConfigEntry,
+    budget_clock,
 ) -> None:
-    """One spare request is not enough for a meter with import and export enabled."""
+    """Schedule the next eligible check in seconds, without spending the last request."""
     budget = async_get_conso_budget(hass)
     for _ in range(2):
         async with budget.request(_PRM):
             pass
-    coordinator = LinkyDataUpdateCoordinator(hass, client, collect_export=True)
+    budget_clock.elapsed += 24 * 60 * 60 - 12
+    coordinator = LinkyDataUpdateCoordinator(
+        hass, client, config_entry=mock_config_entry, collect_export=True
+    )
     client.get_consumption_load_curve.side_effect = _curve
     client.get_production_load_curve.side_effect = _curve
 
-    await coordinator.async_refresh()
-    client.get_consumption_load_curve.assert_not_awaited()
-    client.get_production_load_curve.assert_not_awaited()
+    with (
+        freeze_time("2026-11-16 08:00:00", real_asyncio=True),
+        patch("custom_components.linky.coordinator.async_call_later") as call_later,
+    ):
+        await coordinator.async_refresh()
+        client.get_consumption_load_curve.assert_not_awaited()
+        client.get_production_load_curve.assert_not_awaited()
+        call_later.assert_called_once()
+        _, delay, callback = call_later.call_args.args
+        assert delay == 12
 
-    budget_clock.elapsed += 24 * 60 * 60 + 1
-    await coordinator.async_refresh()
-    client.get_consumption_load_curve.assert_awaited_once()
-    client.get_production_load_curve.assert_awaited_once()
-    write_statistics.assert_awaited_once()
+        budget_clock.elapsed += 12
+        callback(dt_util.utcnow())
+        await asyncio.gather(*mock_config_entry._background_tasks)
+        client.get_consumption_load_curve.assert_awaited_once()
+        client.get_production_load_curve.assert_awaited_once()
+        write_statistics.assert_awaited_once()
 
 
 async def test_slot_skips_startup_and_disabled_polling(

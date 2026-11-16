@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from asyncio import Lock, Task, create_task, get_running_loop, shield, sleep
+from asyncio import Lock, Task, create_task, current_task, get_running_loop, shield, sleep
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import date
 from json import loads
 from math import isfinite
@@ -38,6 +38,10 @@ class ConsoBudgetError(HomeAssistantError):
 
 class ConsoBudgetExceeded(ConsoBudgetError):
     """The meter has no remaining capacity or is in cooldown."""
+
+    def __init__(self, message: str, *, retry_in: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_in = retry_in
 
 
 class _MeterBudget(TypedDict):
@@ -78,6 +82,7 @@ class ConsoBudget:
         self._hass = hass
         self._store = Store[_BudgetData](hass, _VERSION, _KEY, private=True, atomic_writes=True)
         self._lock = Lock()
+        self._batch_owner: Task | None = None
         self._save_task: Task[bool] | None = None
         self._unconfirmed_cooldowns: dict[str, float] = {}
         self._boot_id: str | None = None
@@ -166,10 +171,6 @@ class ConsoBudget:
         self._check_running()
         return data
 
-    def _check_initial_pause(self, data: _BudgetData) -> None:
-        if data["initial_pause_until"] > self._now():
-            raise ConsoBudgetExceeded(_INITIAL_PAUSE_ERROR)
-
     async def _async_save(self, data: _BudgetData) -> None:
         self._check_running()
         now = self._now()
@@ -222,40 +223,61 @@ class ConsoBudget:
     async def _async_check_capacity(
         self, data: _BudgetData, meter: _MeterBudget, prm: str, now: float, required: int
     ) -> list[float]:
-        self._check_initial_pause(data)
+        limit_error = "Conso request limit reached for this meter"
+        if required > _LIMIT:
+            raise ConsoBudgetExceeded(limit_error)
+
+        known = self._unconfirmed_cooldowns.get(prm, 0)
         cooldown = meter["cooldown_until"]
         if cooldown == "pending":
             # A crash or failed settlement left the previous response unknown.
-            meter["cooldown_until"] = max(now + _WINDOW, self._unconfirmed_cooldowns.get(prm, 0))
+            cooldown = meter["cooldown_until"] = max(now + _WINDOW, known)
             await self._async_save(data)
             self._unconfirmed_cooldowns.pop(prm, None)
-            raise ConsoBudgetExceeded(_COOLDOWN_ERROR)
-        if max(cooldown or 0, self._unconfirmed_cooldowns.get(prm, 0)) > now:
-            raise ConsoBudgetExceeded(_COOLDOWN_ERROR)
-        requests = [stamp for stamp in meter["requests"] if stamp > now - _WINDOW]
-        if len(requests) + required > _LIMIT:
-            raise ConsoBudgetExceeded("Conso request limit reached for this meter")
-        return requests
 
-    async def async_claim_daily(self, prm: str, day: date, *, required: int = 1) -> bool:
-        """Claim the caller's Paris calendar day before starting scheduled work."""
+        cooldown_until = max(cooldown or 0, known)
+        pause_until = data["initial_pause_until"]
+        requests = [stamp for stamp in meter["requests"] if stamp > now - _WINDOW]
+        needed = len(requests) + required - _LIMIT
+        if pause_until > now:
+            message = _INITIAL_PAUSE_ERROR
+        elif cooldown_until > now:
+            message = _COOLDOWN_ERROR
+        elif needed > 0:
+            message = limit_error
+        else:
+            return requests
+
+        available_at = sorted(requests)[needed - 1] + _WINDOW if needed > 0 else now
+        retry_at = max(pause_until, cooldown_until, available_at)
+        raise ConsoBudgetExceeded(message, retry_in=max(0.0, retry_at - self._now()))
+
+    @asynccontextmanager
+    async def daily_batch(self, prm: str, day: date, *, required: int = 1) -> AsyncIterator[bool]:
+        """Claim the day and hold transport for requests awaited by this task."""
         async with self._lock:
             data = await self._async_read()
             meter = self._meter(data["meters"], prm)
             day_key = day.isoformat()
-            if meter["day"] is not None and meter["day"] >= day_key:
-                return False
-            if type(required) is not int or required < 1:
-                raise ValueError("A daily claim must require at least one request")
-            await self._async_check_capacity(data, meter, prm, self._now(), required)
-            meter["day"] = day_key
-            await self._async_save(data)
-            return True
+            if meter["day"] is None or meter["day"] < day_key:
+                if type(required) is not int or required < 1:
+                    raise ValueError("A daily claim must require at least one request")
+                await self._async_check_capacity(data, meter, prm, self._now(), required)
+                meter["day"] = day_key
+                await self._async_save(data)
+                self._batch_owner = current_task()
+                try:
+                    yield True
+                finally:
+                    self._batch_owner = None
+                return
+        yield False
 
     @asynccontextmanager
     async def request(self, prm: str) -> AsyncIterator[Callable[[float], None]]:
         """Admit one request and yield a callback to mark a response cooldown in seconds."""
-        async with self._lock:
+        in_batch = self._batch_owner is not None and self._batch_owner is current_task()
+        async with nullcontext() if in_batch else self._lock:
             data = await self._async_read()
             meter = self._meter(data["meters"], prm)
             requests = await self._async_check_capacity(data, meter, prm, self._now(), 1)
