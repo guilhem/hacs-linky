@@ -89,6 +89,21 @@ def test_naive_spring_export_skips_nonexistent_times(tmp_path: Path, day: str) -
     )
 
 
+@pytest.mark.parametrize(
+    "skipped",
+    [
+        '2026-03-29T01:30;2026-03-29T02:00;"null"',
+        '2026-03-29T02:30;2026-03-29T03:00;"null"',
+    ],
+)
+def test_spring_gap_is_reported_at_export_boundary(tmp_path: Path, skipped: str) -> None:
+    path = _write_csv(tmp_path, skipped, '2026-03-29T03:00;2026-03-29T04:00;"2"')
+    assert read_conso_csv(path, _PRM) == (
+        {datetime(2026, 3, 29, 1, tzinfo=UTC): 2.0},
+        ["2026-03-29T01:00:00+01:00"],
+    )
+
+
 def test_midnight_interval_partial_edges_and_internal_gap(tmp_path: Path) -> None:
     path = _write_csv(
         tmp_path,

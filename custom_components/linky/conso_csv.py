@@ -55,7 +55,10 @@ def _parse_rows(rows: Iterator[list[str]], prm: str) -> tuple[Buckets, list[str]
         begin, finish = datetime.fromisoformat(debut), datetime.fromisoformat(fin)
         starts, ends = _utc_candidates(begin), _utc_candidates(finish)
         if not starts or not ends:
-            continue  # The exporter emits naive wall times inside the spring DST gap.
+            # Keep the real hours next to an impossible spring timestamp reportable.
+            invalid_hours.update(_hour(start) for start in starts)
+            invalid_hours.update(_hour(end - datetime.resolution) for end in ends)
+            continue
         aware = begin.tzinfo is not None and finish.tzinfo is not None
         candidates = [
             (start, end) for start in starts for end in ends if timedelta(0) < end - start <= _HOUR
@@ -78,8 +81,13 @@ def _parse_rows(rows: Iterator[list[str]], prm: str) -> tuple[Buckets, list[str]
             # A missing, conflicting or ambiguous reading cannot complete an hour.
             invalid_hours.update((_hour(start), _hour(end - datetime.resolution)))
 
+    if invalid_hours:
+        first = min(first, min(invalid_hours))
+        last = max(last, max(invalid_hours) + _HOUR)
     if first >= last:
         raise ServiceValidationError("Linky CSV contains no readings")
+    if last - first > _MAX_SPAN:
+        raise ServiceValidationError("Linky CSV covers more than 1098 days")
 
     final_instant = last - datetime.resolution
     first_day = first.astimezone(PARIS_TZ).date()

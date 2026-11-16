@@ -19,6 +19,7 @@ from homeassistant.components.recorder.models import (
 )
 from homeassistant.components.recorder.statistics import (
     StatisticsRow,
+    get_metadata_with_session,
     import_statistics,
     statistic_during_period,
     statistics_during_period,
@@ -213,6 +214,13 @@ def _build_fill(
         .where(StatisticsMeta.statistic_id == statistic_id)
     )
     with session_scope(session=recorder.get_session(), read_only=True) as session:
+        stored = get_metadata_with_session(recorder, session, statistic_ids={statistic_id})
+        if statistic_id in stored:
+            unit = stored[statistic_id][1]["unit_of_measurement"]
+            if unit != UnitOfEnergy.KILO_WATT_HOUR:
+                raise HomeAssistantError(
+                    f"Linky statistics use unit {unit!r}; expected kWh for CSV import"
+                )
         since = min(measured).timestamp()
         existing = {
             datetime.fromtimestamp(row.start_ts, UTC): row
@@ -245,14 +253,8 @@ def _build_fill(
         base = predecessor.sum
         if base is None or not isfinite(base):
             raise HomeAssistantError("Linky statistics have an invalid preceding cumulative sum")
-    elif existing:
-        oldest = existing[min(existing)]
-        if oldest.sum is None or oldest.state is None:
-            raise HomeAssistantError("Cannot infer the starting sum for Linky statistics")
-        base = oldest.sum - oldest.state
-        if not isfinite(base):
-            raise HomeAssistantError("Cannot infer the starting sum for Linky statistics")
     else:
+        # Recorder measures the first change from zero, including any adjustment.
         base = 0.0
 
     result: list[StatisticData] = []
