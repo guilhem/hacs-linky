@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Coroutine
+from threading import Lock
 from typing import Any
 
 import voluptuous as vol
+from homeassistant.components.file_upload import process_uploaded_file
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_TOKEN, Platform
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
@@ -20,6 +22,7 @@ from homeassistant.util import dt as dt_util
 
 from .api import AuthenticationError, LinkyClient, PRMAccessError
 from .budget import ConsoBudgetError, async_get_conso_budget
+from .conso_csv import read_conso_csv
 from .const import (
     CONF_COLLECT_EXPORT,
     CONF_DAILY_ONLY,
@@ -29,6 +32,7 @@ from .const import (
     PARIS_TZ,
 )
 from .coordinator import LinkyDataUpdateCoordinator
+from .statistics import Buckets, async_fill_hourly_consumption
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,11 +44,16 @@ type LinkyConfigEntry = ConfigEntry[LinkyDataUpdateCoordinator]
 SERVICE_IMPORT_HISTORICAL_DATA = "import_historical_data"
 SERVICE_REFRESH = "refresh"
 SERVICE_GET_STATUS = "get_status"
+SERVICE_IMPORT_CONSO_CSV = "import_conso_csv"
 ATTR_CONFIG_ENTRY_ID = "config_entry_id"
 ATTR_START_DATE = "start_date"
 ATTR_END_DATE = "end_date"
+ATTR_FILE = "file"
 
 METER_ACTION_SCHEMA = vol.Schema({vol.Required(ATTR_CONFIG_ENTRY_ID): str})
+CSV_ACTION_SCHEMA = METER_ACTION_SCHEMA.extend(
+    {vol.Required(ATTR_FILE): vol.Match(r"[0-9a-f]{32}\Z")}
+)
 SERVICE_IMPORT_HISTORICAL_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_CONFIG_ENTRY_ID): str,
@@ -109,6 +118,30 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         entry = get_loaded_entry(call)
         return await run_entry_action(entry, "status check", entry.runtime_data.async_get_status())
 
+    # A native upload ID is consumed once, even when overlapping actions select it.
+    upload_lock = Lock()
+
+    def read_upload(file_id: str, prm: str) -> tuple[Buckets, list[str]]:
+        try:
+            with upload_lock, process_uploaded_file(hass, file_id) as path:
+                return read_conso_csv(path, prm)
+        except OSError, ValueError:
+            raise ServiceValidationError(
+                "Could not read the uploaded CSV. Select the file again."
+            ) from None
+
+    async def import_csv(file_id: str, prm: str) -> ServiceResponse:
+        hourly, incomplete = await hass.async_add_executor_job(read_upload, file_id, prm)
+        counts = await async_fill_hourly_consumption(hass, prm, hourly)
+        return {**counts, "incomplete_hours": incomplete}
+
+    async def handle_import_conso_csv(call: ServiceCall) -> ServiceResponse:
+        """Fill missing hourly consumption statistics from a local CSV."""
+        entry = get_loaded_entry(call)
+        return await run_entry_action(
+            entry, "CSV import", import_csv(call.data[ATTR_FILE], entry.data[CONF_PRM])
+        )
+
     async_register_admin_service(
         hass,
         DOMAIN,
@@ -130,6 +163,14 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         SERVICE_GET_STATUS,
         handle_get_status,
         schema=METER_ACTION_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_IMPORT_CONSO_CSV,
+        handle_import_conso_csv,
+        schema=CSV_ACTION_SCHEMA,
         supports_response=SupportsResponse.ONLY,
     )
     return True

@@ -90,7 +90,8 @@ and select a meter.
 | --- | --- |
 | **Refresh now** | Run the daily refresh before its scheduled time. The result indicates whether it ran or why it was skipped. A manual attempt uses the same daily slot and request budget as the scheduled refresh. |
 | **Get collection status** | See how many requests are left in the rolling 24-hour budget and why the meter might have to wait. This does not contact Conso. |
-| **Import historical data** | Add up to seven days to Energy. This uses the same request budget. |
+| **Import historical data** | Fetch up to seven days from Conso for Energy. This uses the same request budget. |
+| **Import a Conso Downloader CSV** | Fill gaps in the hourly consumption series from an uploaded file without contacting Conso. |
 
 For a historical import, enter the first day to include, then the first day to
 exclude. For example, **2026-10-01** to **2026-10-08** imports the first seven
@@ -99,8 +100,19 @@ at a time, within the same request budget as the scheduled refresh. A partial
 result reports missing or failed data. You can import the same dates again
 without double counting once the oldest attempts are more than 24 hours old.
 Missing hours are left as gaps, and a day is not added to the daily statistics
-until its load curve is complete. For a large history, use the provider's
-[Conso Downloader](https://github.com/bokub/conso-downloader).
+until its load curve is complete.
+
+To fill a longer gap, select **Import a Conso Downloader CSV**, choose the meter,
+and upload its `historique_conso_<PRM>_<date>.csv` from
+[Conso Downloader](https://github.com/bokub/conso-downloader). Keep the meter
+number in the filename so Linky can match it. Check the response for counts of
+added, identical, and conflicting hours. If the file disagrees with an existing
+hour, the value in Energy is kept. Uploading the same file again adds no points.
+
+The CSV action imports **hourly consumption** only. It reports the timestamps
+of incomplete or ambiguous hours, including clock changes the export does not
+disambiguate. Use the meter's hourly consumption series in Energy to see the
+result.
 
 ## If data is missing
 

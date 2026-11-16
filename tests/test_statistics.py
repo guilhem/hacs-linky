@@ -7,16 +7,21 @@ from unittest.mock import patch
 
 import pytest
 from homeassistant.components.recorder.core import Recorder
+from homeassistant.components.recorder.models import StatisticMeanType, StatisticMetaData
 from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
     import_statistics,
     statistics_during_period,
 )
+from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.util.unit_conversion import EnergyConverter
 
 from custom_components.linky.api import IntervalReading, MeteringData
 from custom_components.linky.const import PARIS_TZ
 from custom_components.linky.statistics import (
+    async_fill_hourly_consumption,
     async_write_statistics,
     daily_energy,
     daily_from_hourly,
@@ -25,6 +30,7 @@ from custom_components.linky.statistics import (
 )
 
 _PRM = "12345678901234"
+_HOURLY_CONSUMPTION = f"linky:{_PRM}_consumption_hourly_energy"
 _HALF_HOUR = timedelta(minutes=30)
 _DAY = timedelta(days=1)
 
@@ -222,6 +228,96 @@ async def test_recorder_insert_revise_and_replay(
         await async_write_statistics(hass, _PRM, {key: update})
         write.assert_not_called()
     assert await rows() == expected
+
+
+async def _hourly_consumption_rows(
+    hass: HomeAssistant, recorder: Recorder, start: datetime
+) -> list[tuple[datetime, float | None, float | None]]:
+    rows = await recorder.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        start,
+        None,
+        {_HOURLY_CONSUMPTION},
+        "hour",
+        None,
+        {"state", "sum"},
+    )
+    return [
+        (datetime.fromtimestamp(row["start"], UTC), row["state"], row["sum"])
+        for row in rows[_HOURLY_CONSUMPTION]
+    ]
+
+
+async def test_recorder_fill_hourly_consumption(
+    hass: HomeAssistant, recorder_mock: Recorder
+) -> None:
+    """Keep stored measurements and Recorder adjustments when filling gaps."""
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+    t = [base + timedelta(hours=i) for i in range(12)]
+    initial = {t[2]: 2.0, t[4]: 4.0, t[8]: 8.0}
+    assert await async_fill_hourly_consumption(hass, _PRM, initial) == {
+        "added": 3,
+        "identical": 0,
+        "conflicts": 0,
+    }
+    for start, adjustment in ((t[2], 10), (t[4], 20), (t[8], -5)):
+        recorder_mock.async_adjust_statistics(_HOURLY_CONSUMPTION, start, adjustment, "kWh")
+
+    measured = {t[0]: 1.0, t[2]: 2.0 + 5e-10, t[3]: 3.0, t[4]: 0.0, t[6]: 5.0}
+    assert await async_fill_hourly_consumption(hass, _PRM, measured) == {
+        "added": 3,
+        "identical": 1,
+        "conflicts": 1,
+    }
+    expected = [
+        (t[0], 1, 11),
+        (t[2], 2, 13),
+        (t[3], 3, 16),
+        (t[4], 4, 40),
+        (t[6], 5, 45),
+        (t[8], 8, 48),
+    ]
+    assert await _hourly_consumption_rows(hass, recorder_mock, base) == expected
+    with patch("custom_components.linky.statistics.import_statistics") as write:
+        assert await async_fill_hourly_consumption(hass, _PRM, measured) == {
+            "added": 0,
+            "identical": 4,
+            "conflicts": 1,
+        }
+        write.assert_not_called()
+    assert await _hourly_consumption_rows(hass, recorder_mock, base) == expected
+
+    # The predecessor is outside the input range, and the intervening hours stay absent.
+    assert (await async_fill_hourly_consumption(hass, _PRM, {t[11]: 1.0}))["added"] == 1
+    assert await _hourly_consumption_rows(hass, recorder_mock, base) == [*expected, (t[11], 1, 49)]
+
+
+@pytest.mark.parametrize(("hour", "error"), [(1, "stored"), (3, "preceding")])
+async def test_recorder_fill_rejects_missing_cumulative_sum(
+    hass: HomeAssistant, recorder_mock: Recorder, hour: int, error: str
+) -> None:
+    """Reject the whole fill if an affected row has no usable cumulative sum."""
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+    bad = base + timedelta(hours=2)
+    metadata = StatisticMetaData(
+        mean_type=StatisticMeanType.NONE,
+        has_sum=True,
+        name=None,
+        source="linky",
+        statistic_id=_HOURLY_CONSUMPTION,
+        unit_class=EnergyConverter.UNIT_CLASS,
+        unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+    )
+    async_add_external_statistics(
+        hass, metadata, [{"start": base, "state": 2, "sum": 2}, {"start": bad, "state": 1}]
+    )
+    with pytest.raises(HomeAssistantError, match=f"invalid {error} cumulative sum"):
+        await async_fill_hourly_consumption(hass, _PRM, {base + timedelta(hours=hour): 3.0})
+    assert await _hourly_consumption_rows(hass, recorder_mock, base) == [
+        (base, 2, 2),
+        (bad, 1, None),
+    ]
 
 
 async def test_recorder_reports_missing_write(hass: HomeAssistant, recorder_mock: Recorder) -> None:

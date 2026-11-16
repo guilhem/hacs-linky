@@ -98,6 +98,20 @@
           "description": "Select the Linky meter to inspect."
         }
       }
+    },
+    "import_conso_csv": {
+      "name": "Import a Conso Downloader CSV",
+      "description": "Fill missing hourly consumption points from a CSV without contacting Conso. Existing values are kept.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Linky meter",
+          "description": "Select the meter whose PRM is in the filename."
+        },
+        "file": {
+          "name": "CSV file",
+          "description": "Select the consumption CSV exported by Conso Downloader."
+        }
+      }
     }
   },
   "entity": {

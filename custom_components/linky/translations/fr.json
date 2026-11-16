@@ -114,6 +114,20 @@
           "description": "Choisissez le compteur à consulter."
         }
       }
+    },
+    "import_conso_csv": {
+      "name": "Importer un CSV Conso Downloader",
+      "description": "Comble les trous de consommation horaire à partir d’un CSV, sans contacter Conso. Les valeurs existantes sont conservées.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Compteur Linky",
+          "description": "Choisissez le compteur dont le PRM figure dans le nom du fichier."
+        },
+        "file": {
+          "name": "Fichier CSV",
+          "description": "Sélectionnez le CSV de consommation exporté par Conso Downloader."
+        }
+      }
     }
   },
   "issues": {

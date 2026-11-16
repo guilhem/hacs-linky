@@ -1,11 +1,15 @@
 """Tests for Linky integration setup and actions."""
 
 import asyncio
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
+from aiohttp import ClientSession
 from freezegun import freeze_time
+from homeassistant.components import file_upload
+from homeassistant.components.recorder.statistics import statistics_during_period
 from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE, ConfigEntryState
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
@@ -14,11 +18,13 @@ from homeassistant.helpers.service import async_get_all_descriptions
 
 from custom_components.linky import (
     SERVICE_GET_STATUS,
+    SERVICE_IMPORT_CONSO_CSV,
     SERVICE_IMPORT_HISTORICAL_DATA,
     SERVICE_REFRESH,
 )
 from custom_components.linky.api import AuthenticationError
 from custom_components.linky.const import CONF_COLLECT_EXPORT, CONF_DAILY_ONLY, DOMAIN
+from custom_components.linky.statistics import async_write_statistics
 
 pytestmark = pytest.mark.usefixtures("recorder_mock")
 
@@ -36,10 +42,18 @@ async def test_setup_entry(
     assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
     assert mock_config_entry.state is ConfigEntryState.NOT_LOADED
     descriptions = (await async_get_all_descriptions(hass))[DOMAIN]
-    for action in (SERVICE_IMPORT_HISTORICAL_DATA, SERVICE_REFRESH, SERVICE_GET_STATUS):
+    for action in (
+        SERVICE_IMPORT_HISTORICAL_DATA,
+        SERVICE_REFRESH,
+        SERVICE_GET_STATUS,
+        SERVICE_IMPORT_CONSO_CSV,
+    ):
         assert descriptions[action]["fields"]["config_entry_id"]["selector"] == {
             "config_entry": {"integration": DOMAIN}
         }
+    assert descriptions[SERVICE_IMPORT_CONSO_CSV]["fields"]["file"]["selector"] == {
+        "file": {"accept": ".csv,text/csv"}
+    }
     mock_http_session.close.assert_not_called()
 
 
@@ -181,6 +195,83 @@ async def test_meter_actions_require_admin_and_a_loaded_entry(
     with pytest.raises(ServiceValidationError, match="Select a loaded Linky meter"):
         await call()
     mock_linky_client.get_consumption_load_curve.assert_not_awaited()
+
+
+async def test_import_conso_csv_fills_energy_gaps_and_replays_offline(
+    hass: HomeAssistant, recorder_mock, mock_config_entry, mock_http_session, tmp_path, monkeypatch
+) -> None:
+    """Run the action with a native upload and query the same series Energy uses."""
+    entry = mock_config_entry
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    prm = entry.data["prm"]
+    base = datetime(2026, 1, 1, 23, tzinfo=UTC)
+    hours = [base + timedelta(hours=i) for i in range(5)]
+    series = ("consumption", "hourly")
+    stat_id = f"linky:{prm}_consumption_hourly_energy"
+    await async_write_statistics(hass, prm, {series: {hours[0]: 1, hours[1]: 2, hours[4]: 4}})
+
+    upload_data = file_upload.FileUploadData(tmp_path / "csv-uploads", {})
+    monkeypatch.setitem(hass.data, file_upload._DATA, upload_data)
+    filename = f"historique_conso_{prm}_2026-01-03.csv"
+    contents = (
+        "debut;fin;kW\n"
+        '2026-01-02T00:00;2026-01-02T00:30;"1,0"\n'
+        '2026-01-02T00:30;2026-01-02T01:00;"1,0"\n'
+        '2026-01-02T01:00;2026-01-02T02:00;"8,0"\n'
+        '2026-01-02T02:00;2026-01-02T02:30;"0,4"\n'
+        '2026-01-02T02:30;2026-01-02T03:00;"0,8"\n'
+        '2026-01-02T03:00;2026-01-02T03:30;"1,2"\n'
+    )
+
+    def stage_upload(file_id: str) -> None:
+        directory = upload_data.file_dir(file_id)
+        directory.mkdir(parents=True)
+        (directory / filename).write_text(contents, encoding="utf-8")
+        upload_data.files[file_id] = filename
+
+    async def import_file():
+        file_id = uuid4().hex
+        await hass.async_add_executor_job(stage_upload, file_id)
+        result = await hass.services.async_call(
+            DOMAIN,
+            SERVICE_IMPORT_CONSO_CSV,
+            {"config_entry_id": entry.entry_id, "file": file_id},
+            blocking=True,
+            return_response=True,
+        )
+        assert file_id not in upload_data.files
+        return result
+
+    async def get_energy():
+        rows = await recorder_mock.async_add_executor_job(
+            statistics_during_period,
+            hass,
+            base,
+            None,
+            {stat_id},
+            "hour",
+            None,
+            {"state", "sum", "change"},
+        )
+        return rows[stat_id]
+
+    with patch.object(
+        ClientSession, "_request", side_effect=AssertionError("Unexpected network request")
+    ) as outbound:
+        first = await import_file()
+        after_first = await get_energy()
+        second = await import_file()
+        assert await get_energy() == after_first
+        outbound.assert_not_called()
+
+    assert (first["added"], first["identical"], first["conflicts"]) == (1, 1, 1)
+    assert (second["added"], second["identical"], second["conflicts"]) == (0, 2, 1)
+    assert list(map(datetime.fromisoformat, first["incomplete_hours"])) == [hours[3]]
+    assert [r["state"] for r in after_first] == pytest.approx([1, 2, 0.6, 4])
+    assert [r["sum"] for r in after_first] == pytest.approx([1, 3, 3.6, 7.6])
+    assert [r["change"] for r in after_first] == pytest.approx([1, 2, 0.6, 4])
+    assert after_first == sorted(after_first, key=lambda row: row["start"])
+    mock_http_session.get.assert_not_called()
 
 
 async def test_import_targets_selected_loaded_meter(
