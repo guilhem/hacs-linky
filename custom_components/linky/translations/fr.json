@@ -57,7 +57,6 @@
     "step": {
       "init": {
         "title": "Options Linky",
-        "description": "Configurez votre tarif d’électricité dans le tableau de bord Énergie de Home Assistant.",
         "data": {
           "scan_interval": "Intervalle de mise à jour"
         },

@@ -43,8 +43,7 @@
         },
         "data_description": {
           "scan_interval": "How often to fetch data (in hours). Linky data has a 24-48h delay."
-        },
-        "description": "Set your electricity price in the Home Assistant Energy dashboard."
+        }
       }
     }
   },
