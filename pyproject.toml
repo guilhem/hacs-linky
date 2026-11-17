@@ -1,6 +1,6 @@
 [project]
 name = "hacs-linky"
-version = "1.0.0rc1"
+version = "1.0.0"
 description = "Home Assistant integration for Linky smart meters"
 readme = "README.md"
 license = "MIT"
