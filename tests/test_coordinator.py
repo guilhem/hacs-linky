@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from freezegun import freeze_time
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.exceptions import (
@@ -283,8 +282,14 @@ async def test_export_defers_until_the_batch_fits_in_the_rolling_budget(
     write_statistics: AsyncMock,
     mock_config_entry: ConfigEntry,
     budget_clock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Schedule the next eligible check in seconds, without spending the last request."""
+    now = datetime(2026, 11, 16, 8, tzinfo=UTC)
+    monkeypatch.setattr(
+        "custom_components.linky.coordinator.dt_util",
+        SimpleNamespace(now=lambda tz: now.astimezone(tz), utcnow=lambda: now),
+    )
     budget = async_get_conso_budget(hass)
     for _ in range(2):
         async with budget.request(_PRM):
@@ -296,10 +301,7 @@ async def test_export_defers_until_the_batch_fits_in_the_rolling_budget(
     client.get_consumption_load_curve.side_effect = _curve
     client.get_production_load_curve.side_effect = _curve
 
-    with (
-        freeze_time("2026-11-16 08:00:00", real_asyncio=True),
-        patch("custom_components.linky.coordinator.async_call_later") as call_later,
-    ):
+    with patch("custom_components.linky.coordinator.async_call_later") as call_later:
         assert (await coordinator.async_get_status())["retry_in_seconds"] == 12
         result = await coordinator.async_refresh_now()
         assert result["status"] == "skipped"
@@ -312,7 +314,8 @@ async def test_export_defers_until_the_batch_fits_in_the_rolling_budget(
         assert delay == 12
 
         budget_clock.elapsed += 12
-        callback(dt_util.utcnow())
+        now += timedelta(seconds=12)
+        callback(now)
         await asyncio.gather(*mock_config_entry._background_tasks)
         client.get_consumption_load_curve.assert_awaited_once()
         client.get_production_load_curve.assert_awaited_once()
